@@ -45,8 +45,8 @@ class AgentManager:
         self.scores = [0 for _ in range(self.total_population)]
 
         print("starting frontend")
-        app = MainWindow(self)
-        app.mainloop()
+        self.frontend = MainWindow(self)
+        self.frontend.mainloop()
 
     def set_env(self, env_name):
         print("setting env to", env_name)
@@ -72,8 +72,10 @@ class AgentManager:
         for e in range(self.generations):
             for p in range(self.total_population):
                 agent_score = 0
-                print(f"\rplaying agent {p}", end="", flush=True)
                 for ep in range(self.episodes_per_agent):
+                    a_status = f"gen: {e+1} agent {p} episode {ep+1}/{self.episodes_per_agent}"
+                    print("\r" + a_status, end="", flush=True)
+                    self.frontend.control_window.status1_label_var.set(a_status)
                     do_render = True if p in best_agents[:3] and self.render_best \
                         or self.render_all_agents \
                         else False
@@ -90,6 +92,7 @@ class AgentManager:
             self.scores = [0 for _ in range(self.total_population)]
             for a in self.agents:
                 a.reset()
+        self.frontend.control_window.train_thread = None
 
     def play_episode(self, agent, env, do_render=False, timestep_limit=None):
         agent_score = 0
@@ -144,8 +147,11 @@ class AgentManager:
                 if _agent.score == self.scores[i] and _agent.agent_id not in best_agents:
                     best_agents.append(_agent.agent_id)
                     break
-        print(f"\rgen: {epoch + 1} avg: {round(overall_avg_score, ndigits=2)} high: {round(high_score, ndigits=2)} "
-              f"top 3: {best_agents[:3]} best layout: {self.agents[best_agents[0]].network_layout}")
+        e_status = f"gen: {epoch + 1} avg: {round(overall_avg_score, ndigits=2)} high: {round(high_score, ndigits=2)}" \
+                   f" top 3: {best_agents[:3]} best layout: {self.agents[best_agents[0]].network_layout}"
+        print("\r"+e_status)
+        self.frontend.control_window.status2_label_var.set(e_status)
+
         for p in range(self.total_population):
             if p not in best_agents:
                 self.agents[p].network = self.cross_over(best_agents)
@@ -269,9 +275,12 @@ class ControlWindow:
         self.root = root
         self.font = ("helvetica", 10)
         self.frame = tk.Frame(root, width=width, height=height, bd=bd, relief=relief)
+
+        # The Start button (don't touch it)
         self.start_train_button = tk.Button(self.frame, width=5, height=1, text="START", command=self.start_train)
         self.start_train_button.place(x=10, y=10)
 
+        # Mutate controls
         self.mutate_chance_title = tk.Label(self.frame, width=11, height=1, text="Mutate Chance")
         self.mutate_chance_title.place(x=10, y=52)
         self.chance_down_button = tk.Button(self.frame, width=1, height=0, text="-", command=self.chance_down_func)
@@ -294,34 +303,44 @@ class ControlWindow:
         self.mutate_up_button = tk.Button(self.frame, width=1, height=1, text="+", command=self.amount_up_func)
         self.mutate_up_button.place(x=170, y=90)
 
+        # Save and Load buttons
         self.save_button = tk.Button(self.frame, width=5, height=1, text="SAVE", command=self.save_population)
         self.save_button.place(x=150, y=10)
         self.load_button = tk.Button(self.frame, width=5, height=1, text="LOAD", command=self.load_population)
         self.load_button.place(x=200, y=10)
 
-        self.render_title = tk.Label(self.frame, width=5, height=1, text="Render")
-        self.render_title.place(x=400, y=12)
+        # Render options
+        self.render_title = tk.Label(self.frame, width=11, height=1, text="Render Options")
+        self.render_title.place(x=440, y=12)
         self.render_done_checkbox = tk.Checkbutton(self.frame, width=5, height=1,
                                                    text="Done", command=self.toggle_render_done)
-        self.render_done_checkbox.place(x=300, y=40)
+        self.render_done_checkbox.place(x=300, y=35)
         self.render_watchdog_checkbox = tk.Checkbutton(self.frame, width=7, height=1,
                                                        text="Watchdog", command=self.toggle_render_watchdog)
-        self.render_watchdog_checkbox.place(x=375, y=40)
+        self.render_watchdog_checkbox.place(x=365, y=35)
         self.render_best_checkbox = tk.Checkbutton(self.frame, width=3, height=1,
-                                                   text="Best", command=self.toggle_render_best)
-        self.render_best_checkbox.place(x=450, y=40)
+                                                   text="Best 3", command=self.toggle_render_best)
+        self.render_best_checkbox.place(x=450, y=35)
         self.render_all_agents_checkbox = tk.Checkbutton(self.frame, width=5, height=1,
                                                          text="Agents", command=self.toggle_render_all_agents)
-        self.render_all_agents_checkbox.place(x=525, y=40)
+        self.render_all_agents_checkbox.place(x=525, y=35)
         self.render_all_episodes_checkbox = tk.Checkbutton(self.frame, width=5, height=1,
                                                            text="Episodes", command=self.toggle_render_all_episodes)
-        self.render_all_episodes_checkbox.place(x=600, y=40)
-        # self.record_time_label_title = tk.Label(self.frame, width=10, height=1, text="ELAPSED")
-        # self.record_time_label_title.place(x=200, y=12)
-        # self.record_time_label_var = tk.StringVar()
-        # self.record_time_label_var.set("00:00:00")
-        # self.record_time_label = tk.Label(self.frame, width=7, height=1, textvariable=self.record_time_label_var)
-        # self.record_time_label.place(x=265, y=12)
+        self.render_all_episodes_checkbox.place(x=600, y=35)
+
+        # Status Label1
+        self.status1_label_var = tk.StringVar()
+        self.status1_label_var.set("-Status1 No output yet-")
+        self.status1_label = tk.Label(self.frame, width=93, height=1, bg="#FFFFFF", fg="#000000",
+                                      textvariable=self.status1_label_var)
+        self.status1_label.place(x=10, y=127)
+
+        # Status Label2
+        self.status2_label_var = tk.StringVar()
+        self.status2_label_var.set("-Status2 No output yet-")
+        self.status2_label = tk.Label(self.frame, width=93, height=1, bg="#FFFFFF", fg="#000000",
+                                      textvariable=self.status2_label_var)
+        self.status2_label.place(x=10, y=150)
         self.start_time = time()
         self.train_thread = None
 
@@ -370,11 +389,11 @@ class ControlWindow:
 
     def save_population(self):
         pickle.dump(self.root.manager_object.agents, open("saved_population.p", "wb"))
-        print("population saved")
+        print("\rpopulation saved")
 
     def load_population(self):
         self.root.manager_object.agents = pickle.load(open("saved_population.p", "rb"))
-        print("population loaded")
+        print("\rpopulation loaded")
 
     def start_train(self):
         if self.train_thread is not None:
