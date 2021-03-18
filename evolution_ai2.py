@@ -1,15 +1,18 @@
 from copy import deepcopy
 from math import tanh
 from random import randrange, random, choice, shuffle
+from time import time
+from threading import Thread
 import gym
-# import pybullet_envs
 import numpy as np
+import tkinter as tk
+import pickle
 
 
 class AgentManager:
     def __init__(self, population=50, network_layout=None, env_name=None, continuous_action=True, generations=999,
-                 episodes_per_agent=1, pool_size=10, obs_scale=1, action_scale=1, input_nodes=2, output_nodes=2,
-                 timestep_limit=None):
+                 episodes_per_agent=1, pool_size=0.25, obs_scale=1, action_scale=1, input_nodes=2, output_nodes=2,
+                 timestep_limit=None, use_watchdog=-1):
         self.input_nodes = input_nodes
         self.output_nodes = output_nodes
         self.generations = generations
@@ -19,11 +22,18 @@ class AgentManager:
         self.env_name = env_name
         self.continuous_action = continuous_action
         self.timestep_limit = timestep_limit
+        self.use_watchdog = use_watchdog
         self.network_layout = network_layout
         self.episodes_per_agent = episodes_per_agent
-        self.mutate_chance = 0.2
+        self.mutate_chance = 0.1
         self.max_mutate_amount = 0.2
-        self.population_to_keep = pool_size
+        self.population_to_keep = int(self.total_population * pool_size)
+        print(f"pool/population size {self.population_to_keep}/{self.total_population}")
+        self.render_done = False
+        self.render_watchdog = False
+        self.render_best = False
+        self.render_all_agents = False
+        self.render_all_episodes = False
 
         if self.env_name is None:
             self.train_env = None
@@ -33,6 +43,10 @@ class AgentManager:
 
         self.agents = self.create_population()
         self.scores = [0 for _ in range(self.total_population)]
+
+        print("starting frontend")
+        app = MainWindow(self)
+        app.mainloop()
 
     def set_env(self, env_name):
         print("setting env to", env_name)
@@ -46,7 +60,7 @@ class AgentManager:
     def create_population(self):
         agents = []
         for a in range(self.total_population):
-            agent = Agent(agent_id=a, continuous_action=self.continuous_action,
+            agent = Agent(agent_id=a, network_layout=self.network_layout, continuous_action=self.continuous_action,
                           input_nodes=self.input_nodes, output_nodes=self.output_nodes)
             agents.append(agent)
         return agents
@@ -58,9 +72,12 @@ class AgentManager:
         for e in range(self.generations):
             for p in range(self.total_population):
                 agent_score = 0
-                print(f"\rplaying agent {p}", end="")
+                print(f"\rplaying agent {p}", end="", flush=True)
                 for ep in range(self.episodes_per_agent):
-                    do_render = True if len(best_agents) > 0 and p in best_agents[:3] and ep == 0 else False
+                    do_render = True if p in best_agents[:3] and self.render_best \
+                        or self.render_all_agents \
+                        else False
+                    do_render = False if ep != 0 and self.render_all_episodes is False else do_render
                     agent_score += self.play_episode(self.agents[p], self.train_env, do_render=do_render)
                 agent_score /= self.episodes_per_agent
                 # print(f"epoch {e} agent {p} score {agent_score}")
@@ -76,6 +93,7 @@ class AgentManager:
 
     def play_episode(self, agent, env, do_render=False, timestep_limit=None):
         agent_score = 0
+        old_agent_score = 0
         timestep_limit = timestep_limit if timestep_limit is not None else self.timestep_limit
         obs_scale_factor = 1 if self.obs_scale_factor is None else self.obs_scale_factor
         action_scale_factor = 1 if self.action_scale_factor is None else self.action_scale_factor
@@ -85,9 +103,9 @@ class AgentManager:
         if do_render:
             env.render()
         while not done:
-            # if abs(max(obs)) > 1:
-            #     obs_scale_factor += 0.5
-            #     print(max(obs), "increasing scale_factor to", obs_scale_factor)
+            if abs(max(obs)) > 1 and obs_scale_factor != 1:
+                obs_scale_factor += 0.5
+                print(max(obs), "increasing scale_factor to", obs_scale_factor)
             action = agent.predict(obs)
             action = list(np.array(action) * action_scale_factor) if self.continuous_action is True else action
             obs, reward, done, info = env.step(action)
@@ -98,6 +116,15 @@ class AgentManager:
             timestep += 1
             if timestep_limit is not None and timestep >= timestep_limit:
                 done = True
+            if self.use_watchdog != -1 and timestep != 0 and timestep % self.use_watchdog == 0:
+                if agent_score <= old_agent_score:
+                    # print(f"\ragent {agent.agent_id} died from watchdog")
+                    done = True
+                old_agent_score = agent_score
+                if not do_render and self.render_watchdog:
+                    env.render()
+        if not do_render and self.render_done:
+            env.render()
         return agent_score
 
     def process_agents(self, epoch):
@@ -186,7 +213,7 @@ class Agent:
             for _node in range(self.network_layout[layer]):
                 weights_per_node = []
                 for weight in range(self.network_layout[layer + 1]):
-                    weights_per_node.append((random() - 0.5) * 2)
+                    weights_per_node.append((random() - 0.5))
                 layer_nodes.append(weights_per_node)
             finished_network.append(layer_nodes)
         return deepcopy(finished_network)
@@ -222,8 +249,144 @@ class Agent:
         self.score = 0
 
 
+class MainWindow(tk.Tk):
+    def __init__(self, manager_object):
+        super(MainWindow, self).__init__()
+        self.title("Evolution AI Controller v1.0")
+        self.font = ("helvetica", 10)
+        self.update_delay = 0.5
+        self.canvas = tk.Canvas(self, width=720, height=255, bg="#555555")
+        self.canvas.pack()
+        self.resizable(width=False, height=False)
+
+        self.manager_object = manager_object
+        self.control_window = ControlWindow(self)
+        self.control_window.frame.place(x=10, y=10)
+
+
+class ControlWindow:
+    def __init__(self, root, width=700, height=200, bd=10, relief="ridge"):
+        self.root = root
+        self.font = ("helvetica", 10)
+        self.frame = tk.Frame(root, width=width, height=height, bd=bd, relief=relief)
+        self.start_train_button = tk.Button(self.frame, width=5, height=1, text="START", command=self.start_train)
+        self.start_train_button.place(x=10, y=10)
+
+        self.mutate_chance_title = tk.Label(self.frame, width=11, height=1, text="Mutate Chance")
+        self.mutate_chance_title.place(x=10, y=52)
+        self.chance_down_button = tk.Button(self.frame, width=1, height=0, text="-", command=self.chance_down_func)
+        self.chance_down_button.place(x=110, y=50)
+        self.mutate_chance_label_var = tk.StringVar()
+        self.mutate_chance_label_var.set(str(self.root.manager_object.mutate_chance))
+        self.mutate_chance_label = tk.Label(self.frame, width=5, height=1, textvariable=self.mutate_chance_label_var)
+        self.mutate_chance_label.place(x=130, y=52)
+        self.chance_up_button = tk.Button(self.frame, width=1, height=1, text="+", command=self.chance_up_func)
+        self.chance_up_button.place(x=170, y=50)
+
+        self.mutate_amount_title = tk.Label(self.frame, width=11, height=1, text="Mutate Amount")
+        self.mutate_amount_title.place(x=10, y=92)
+        self.mutate_down_button = tk.Button(self.frame, width=1, height=1, text="-", command=self.amount_down_func)
+        self.mutate_down_button.place(x=110, y=90)
+        self.mutate_amount_label_var = tk.StringVar()
+        self.mutate_amount_label_var.set(str(self.root.manager_object.max_mutate_amount))
+        self.mutate_amount_label = tk.Label(self.frame, width=5, height=1, textvariable=self.mutate_amount_label_var)
+        self.mutate_amount_label.place(x=130, y=92)
+        self.mutate_up_button = tk.Button(self.frame, width=1, height=1, text="+", command=self.amount_up_func)
+        self.mutate_up_button.place(x=170, y=90)
+
+        self.save_button = tk.Button(self.frame, width=5, height=1, text="SAVE", command=self.save_population)
+        self.save_button.place(x=150, y=10)
+        self.load_button = tk.Button(self.frame, width=5, height=1, text="LOAD", command=self.load_population)
+        self.load_button.place(x=200, y=10)
+
+        self.render_title = tk.Label(self.frame, width=5, height=1, text="Render")
+        self.render_title.place(x=400, y=12)
+        self.render_done_checkbox = tk.Checkbutton(self.frame, width=5, height=1,
+                                                   text="Done", command=self.toggle_render_done)
+        self.render_done_checkbox.place(x=300, y=40)
+        self.render_watchdog_checkbox = tk.Checkbutton(self.frame, width=7, height=1,
+                                                       text="Watchdog", command=self.toggle_render_watchdog)
+        self.render_watchdog_checkbox.place(x=375, y=40)
+        self.render_best_checkbox = tk.Checkbutton(self.frame, width=3, height=1,
+                                                   text="Best", command=self.toggle_render_best)
+        self.render_best_checkbox.place(x=450, y=40)
+        self.render_all_agents_checkbox = tk.Checkbutton(self.frame, width=5, height=1,
+                                                         text="Agents", command=self.toggle_render_all_agents)
+        self.render_all_agents_checkbox.place(x=525, y=40)
+        self.render_all_episodes_checkbox = tk.Checkbutton(self.frame, width=5, height=1,
+                                                           text="Episodes", command=self.toggle_render_all_episodes)
+        self.render_all_episodes_checkbox.place(x=600, y=40)
+        # self.record_time_label_title = tk.Label(self.frame, width=10, height=1, text="ELAPSED")
+        # self.record_time_label_title.place(x=200, y=12)
+        # self.record_time_label_var = tk.StringVar()
+        # self.record_time_label_var.set("00:00:00")
+        # self.record_time_label = tk.Label(self.frame, width=7, height=1, textvariable=self.record_time_label_var)
+        # self.record_time_label.place(x=265, y=12)
+        self.start_time = time()
+        self.train_thread = None
+
+    def amount_down_func(self):
+        new_amount = self.root.manager_object.max_mutate_amount - 0.05
+        self.root.manager_object.max_mutate_amount = new_amount
+        self.mutate_amount_label_var.set(str(round(new_amount, ndigits=3)))
+        print("\rmax mutate amount =", str(round(new_amount, ndigits=3)))
+
+    def amount_up_func(self):
+        new_amount = self.root.manager_object.max_mutate_amount + 0.05
+        self.root.manager_object.max_mutate_amount = new_amount
+        self.mutate_amount_label_var.set(str(round(new_amount, ndigits=3)))
+        print("\rmax mutate amount =", str(round(new_amount, ndigits=3)))
+
+    def chance_down_func(self):
+        new_amount = self.root.manager_object.mutate_chance - 0.05
+        self.root.manager_object.mutate_chance = new_amount
+        self.mutate_chance_label_var.set(str(round(new_amount, ndigits=3)))
+        print("\rmutate chance =", str(round(new_amount, ndigits=3)))
+
+    def chance_up_func(self):
+        new_amount = self.root.manager_object.mutate_chance + 0.05
+        self.root.manager_object.mutate_chance = new_amount
+        self.mutate_chance_label_var.set(str(round(new_amount, ndigits=3)))
+        print("\rmutate chance =", str(round(new_amount, ndigits=3)))
+
+    def toggle_render_done(self):
+        self.root.manager_object.render_done = True if self.root.manager_object.render_done is False else False
+
+    def toggle_render_watchdog(self):
+        self.root.manager_object.render_watchdog = True if self.root.manager_object.render_watchdog is False\
+            else False
+
+    def toggle_render_best(self):
+        self.root.manager_object.render_best = True if self.root.manager_object.render_best is False\
+            else False
+
+    def toggle_render_all_agents(self):
+        self.root.manager_object.render_all_agents = True if self.root.manager_object.render_all_agents is False\
+            else False
+
+    def toggle_render_all_episodes(self):
+        self.root.manager_object.render_all_episodes = True if self.root.manager_object.render_all_episodes is False \
+            else False
+
+    def save_population(self):
+        pickle.dump(self.root.manager_object.agents, open("saved_population.p", "wb"))
+        print("population saved")
+
+    def load_population(self):
+        self.root.manager_object.agents = pickle.load(open("saved_population.p", "rb"))
+        print("population loaded")
+
+    def start_train(self):
+        if self.train_thread is not None:
+            print("train thread already running")
+        else:
+            self.train_thread = Thread(target=self.root.manager_object.train, daemon=True)
+            self.train_thread.start()
+
+
 if __name__ == "__main__":
-    manager = AgentManager(population=50, pool_size=5, env_name="LunarLanderContinuous-v2", generations=500,
-                           input_nodes=8, output_nodes=2, continuous_action=True, episodes_per_agent=10,
-                           obs_scale=1, action_scale=1)
-    manager.train()
+    mngr = AgentManager(population=100, network_layout=[8, 10, 10, 2], env_name="LunarLanderContinuous-v2",
+                        generations=500, continuous_action=True, episodes_per_agent=10, use_watchdog=300,
+                        obs_scale=1, action_scale=1)
+
+    # mngr.train()
