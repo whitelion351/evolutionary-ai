@@ -35,14 +35,16 @@ class AgentManager:
         self.max_mutate_amount = 0.2
         self.population_to_keep = int(self.total_population * pool_size)
         print(f"pool/population size {self.population_to_keep}/{self.total_population}")
+        self.model_dir = "models/"
+        self.worker_dir = "workers/"
         self.render_done = False
         self.render_watchdog = False
         self.render_best = False
         self.render_all_agents = False
         self.render_all_episodes = False
         for w in range(self.n_procs):
-            self.remove_file("worker"+str(w))
-            self.remove_file("worker"+str(w)+"result")
+            self.remove_file(self.worker_dir+"worker"+str(w))
+            self.remove_file(self.worker_dir+"worker"+str(w)+"result")
 
         if self.env_name is None:
             self.train_env = None
@@ -55,7 +57,7 @@ class AgentManager:
 
         print(f"starting {self.n_procs} processes")
         for w in range(self.n_procs):
-            proc = Process(target=self.worker, daemon=True, args=(w,))
+            proc = Process(name="worker"+str(w), target=self.worker, daemon=True, args=(w,))
             proc.start()
 
         sleep(1.0)
@@ -94,8 +96,7 @@ class AgentManager:
         print("started worker", w_id, "with affinity", proc.cpu_affinity())
         while True:
             try:
-                worker_work = pickle.load(open("worker" + str(w_id), "rb"))
-                # print(f"worker {w_id} starting agent {worker_work[1]['agent_id']}")
+                worker_work = pickle.load(open(self.worker_dir+"worker" + str(w_id), "rb"))
                 agent = worker_work[0]
                 eps_per_agent = worker_work[1]["eps"]
                 agent_score = 0
@@ -107,9 +108,8 @@ class AgentManager:
                                                      render_done=worker_work[1]["render_done"],
                                                      timestep_limit=self.timestep_limit)
                 agent_score /= self.episodes_per_agent
-                os.remove("worker" + str(w_id))
-                # print(f"worker {w_id} finished agent {worker_work[1]['agent_id']} score: {agent_score}")
-                pickle.dump(agent_score, open("worker"+str(w_id)+"result", "wb"))
+                self.remove_file(self.worker_dir+"worker" + str(w_id))
+                pickle.dump(agent_score, open(self.worker_dir+"worker"+str(w_id)+"result", "wb"))
                 sleep(0.1)
             except (FileNotFoundError, EOFError):
                 sleep(0.1)
@@ -123,9 +123,6 @@ class AgentManager:
             completed_agents = 0
             proc_ids = [-1 for _ in range(self.n_procs)]
             while completed_agents < self.total_population:
-                a_status = f"gen: {e+1} agent: {next_agent-1}"
-                # print("" + a_status)
-                self.frontend.control_window.status1_label_var.set(a_status)
                 for proc_id in range(self.n_procs):
                     if next_agent < self.total_population and proc_ids[proc_id] == -1:
                         do_render = True if next_agent in best_agents[:3] and self.render_best \
@@ -134,27 +131,30 @@ class AgentManager:
                         pickle.dump([self.agents[next_agent],
                                      {"agent_id": next_agent, "eps": self.episodes_per_agent, "do_render": do_render,
                                       "render_watchdog": self.render_watchdog, "render_done": self.render_done,
-                                      "all_eps": self.render_all_episodes}], open("worker"+str(proc_id), "wb"))
+                                      "all_eps": self.render_all_episodes}], open(self.worker_dir+"worker"+str(proc_id), "wb"))
                         proc_ids[proc_id] = next_agent
                         next_agent += 1
                         sleep(0.1)
                     else:
                         try:
-                            agent_score = pickle.load(open("worker"+str(proc_id)+"result", "rb"))
+                            agent_score = pickle.load(open(self.worker_dir+"worker"+str(proc_id)+"result", "rb"))
                             if agent_score is None:
+                                self.remove_file(self.worker_dir+"worker"+str(proc_id)+"result")
                                 pickle.dump([self.agents[proc_ids[proc_id]],
                                              {"agent_id": proc_ids[proc_id],
                                               "eps": self.episodes_per_agent, "do_render": False,
                                               "all_eps": self.render_all_episodes}],
-                                            open("worker" + str(proc_id), "wb"))
+                                            open(self.worker_dir+"worker" + str(proc_id), "wb"))
                             else:
                                 self.scores[proc_ids[proc_id]] = agent_score
                                 self.agents[proc_ids[proc_id]].score = agent_score
                                 completed_agents += 1
                                 proc_ids[proc_id] = -1
-                                os.remove("worker"+str(proc_id)+"result")
+                                self.remove_file(self.worker_dir+"worker"+str(proc_id)+"result")
                         except (FileNotFoundError, EOFError):
                             sleep(0.1)
+                a_status = f"gen: {e+1} agent: {next_agent-1}"
+                self.frontend.control_window.status1_label_var.set(a_status)
             best_agents = self.process_agents(e)
             self.scores = [0 for _ in range(self.total_population)]
             for a in self.agents:
@@ -217,7 +217,7 @@ class AgentManager:
                     break
         e_status = f"gen: {epoch + 1} avg: {round(overall_avg_score, ndigits=2)} high: {round(high_score, ndigits=2)}" \
                    f" top 3: {best_agents[:3]} best layout: {self.agents[best_agents[0]].network_layout}"
-        print("\r"+e_status)
+        print(e_status)
         self.frontend.control_window.status2_label_var.set(e_status)
 
         # all_agents = list(range(self.total_population))
@@ -456,24 +456,26 @@ class ControlWindow:
             else False
 
     def save_pop(self, save_name=None):
-        save_name = self.root.manager_object.env_name+"_saved_population.p" if save_name is None else save_name
+        save_name = self.root.manager_object.worker_dir+self.root.manager_object.env_name+"_saved_population.p" \
+            if save_name is None else save_name
         pickle.dump(self.root.manager_object.agents, open(save_name, "wb"))
-        print("\rpopulation saved")
+        print("population saved")
 
     def load_pop(self, load_name=None):
-        load_name = self.root.manager_object.env_name+"_saved_population.p" if load_name is None else load_name
+        load_name = self.root.manager_object.worker_dir+self.root.manager_object.env_name+"_saved_population.p" \
+            if load_name is None else load_name
         self.root.manager_object.agents = pickle.load(open(load_name, "rb"))
-        print("\rpopulation loaded")
+        print("population loaded")
 
     def start_train(self):
         if self.train_thread is not None:
-            print("\rtrain thread already running")
+            print("train thread already running")
         else:
-            self.train_thread = Thread(target=self.root.manager_object.train, daemon=True)
+            self.train_thread = Thread(name="training_thread", target=self.root.manager_object.train, daemon=True)
             self.train_thread.start()
 
 
 if __name__ == "__main__":
-    manager = AgentManager(population=100, pool_size=0.1, network_layout=[24, 16, 16, 4], env_name="BipedalWalker-v3",
-                           continuous_action=True, episodes_per_agent=5, use_watchdog=300, watchdog_penalty=100,
+    manager = AgentManager(population=100, pool_size=0.1, network_layout=[6, 16, 16, 3], env_name="Acrobot-v1",
+                           continuous_action=False, episodes_per_agent=5, use_watchdog=-1, watchdog_penalty=0,
                            generations=500, obs_scale=1, action_scale=1)
