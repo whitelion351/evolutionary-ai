@@ -31,6 +31,8 @@ class AgentManager:
         self.use_watchdog = use_watchdog
         self.network_layout = network_layout
         self.episodes_per_agent = episodes_per_agent
+        self.cross_over_chance = 0.5
+        self.random_weight_chance = 0.01
         self.mutate_chance = 0.1
         self.max_mutate_amount = 0.2
         self.population_to_keep = int(self.total_population * pool_size)
@@ -131,7 +133,8 @@ class AgentManager:
                         pickle.dump([self.agents[next_agent],
                                      {"agent_id": next_agent, "eps": self.episodes_per_agent, "do_render": do_render,
                                       "render_watchdog": self.render_watchdog, "render_done": self.render_done,
-                                      "all_eps": self.render_all_episodes}], open(self.worker_dir+"worker"+str(proc_id), "wb"))
+                                      "all_eps": self.render_all_episodes}],
+                                    open(self.worker_dir+"worker"+str(proc_id), "wb"))
                         proc_ids[proc_id] = next_agent
                         next_agent += 1
                         sleep(0.1)
@@ -223,20 +226,29 @@ class AgentManager:
         # all_agents = list(range(self.total_population))
         for p in range(self.total_population):
             if p not in best_agents:
-                self.agents[p].network = self.cross_over(best_agents, best_agents)
-                self.agents[p].network = self.mutate_network([p])
+                if random() < self.cross_over_chance:
+                    self.agents[p].network, self.agents[p].biases = self.cross_over(best_agents, best_agents)
+                self.agents[p].network, self.agents[p].biases = self.mutate_network([p])
+                if p == 0:
+                    debug_net = self.agents[p].biases
+                    # print(debug_net)
         return best_agents
 
     def cross_over(self, agent_list_a, agent_list_b):
         net_a = deepcopy(self.agents[choice(agent_list_a)].network)
+        net_a_bias = deepcopy(self.agents[choice(agent_list_a)].biases)
         net_b = self.agents[choice(agent_list_b)].network
+        net_b_bias = self.agents[choice(agent_list_b)].biases
 
         for layer_index, layer in enumerate(net_a):
             for node_index, node in enumerate(layer):
                 for weight_index, weight in enumerate(node):
                     if random() >= 0.5:
                         net_a[layer_index][node_index][weight_index] = net_b[layer_index][node_index][weight_index]
-        return deepcopy(net_a)
+            for bias_index, bias in enumerate(net_a_bias[layer_index]):
+                if random() >= 0.5:
+                    net_a_bias[layer_index][bias_index] = net_b_bias[layer_index][bias_index]
+        return deepcopy(net_a), deepcopy(net_a_bias)
 
     @staticmethod
     def random_float():
@@ -245,15 +257,22 @@ class AgentManager:
     def mutate_network(self, agent_list):
         chosen_one = choice(agent_list)
         chosen_network = deepcopy(self.agents[chosen_one].network)
+        chosen_biases = deepcopy(self.agents[chosen_one].biases)
         for layer in range(len(chosen_network)):
             for node in range(len(chosen_network[layer])):
                 for weight in range(len(chosen_network[layer][node])):
                     if random() < self.mutate_chance:
                         _weight = chosen_network[layer][node][weight] + (self.random_float() * self.max_mutate_amount)
-                        if abs(_weight) > 1.0:
+                        if abs(_weight) > 1.0 or random() < self.random_weight_chance:
                             _weight = self.random_float()
                         chosen_network[layer][node][weight] = _weight
-        return deepcopy(chosen_network)
+            for bias in range(len(chosen_biases[layer])):
+                if 0 <= layer < len(chosen_network) - 1 and random() < self.mutate_chance:
+                    _bias = chosen_biases[layer][bias] + (self.random_float() * self.max_mutate_amount)
+                    if abs(_bias) > 1.0 or random() < self.random_weight_chance:
+                        _bias = self.random_float()
+                    chosen_biases[layer][bias] = _bias
+        return deepcopy(chosen_network), deepcopy(chosen_biases)
 
 
 class Agent:
@@ -266,11 +285,11 @@ class Agent:
         self.output_nodes = output_nodes
         self.continuous_action = continuous_action
         self.min_layers = 2
-        self.max_layers = 2
-        self.min_layer_nodes = 16
+        self.max_layers = 3
+        self.min_layer_nodes = 8
         self.max_layer_nodes = 16
         self.network_layout = network_layout
-        self.network = self.initialize_network()
+        self.network, self.biases = self.initialize_network()
 
     def initialize_network(self):
         if self.network_layout is None:
@@ -282,21 +301,28 @@ class Agent:
             self.network_layout = new_layout
 
         finished_network = []
+        finished_biases = []
         for layer in range(len(self.network_layout) - 1):
             layer_nodes = []
             for _node in range(self.network_layout[layer]):
                 weights_per_node = []
                 for weight in range(self.network_layout[layer + 1]):
-                    weights_per_node.append((random() - 0.5))
+                    weights_per_node.append(random() - 0.5)
                 layer_nodes.append(weights_per_node)
             finished_network.append(layer_nodes)
-        return deepcopy(finished_network)
+            if layer == (len(self.network_layout) - 1) - 1:
+                layer_biases = [0 for _ in range(len(layer_nodes[-1]))]
+            else:
+                layer_biases = [(random() - 0.5) for _ in range(len(layer_nodes[-1]))]
+            finished_biases.append(layer_biases)
+        return deepcopy(finished_network), deepcopy(finished_biases)
 
     def predict(self, obs):
         return self.calculate_action(obs)
 
     def calculate_action(self, input_layer):
         weights = self.network
+        biases = self.biases
         network_activations = [input_layer]
         for layer in range(len(self.network_layout) - 1):
             result = []
@@ -313,7 +339,8 @@ class Agent:
                 activation = 0
                 for from_node in range(len(interim_result)):
                     activation += interim_result[from_node][index]
-                input_layer.append(tanh(activation))
+                bias = biases[layer][index]
+                input_layer.append(tanh(activation+bias))
             network_activations.append(input_layer)
         if self.continuous_action:
             return input_layer
@@ -456,13 +483,13 @@ class ControlWindow:
             else False
 
     def save_pop(self, save_name=None):
-        save_name = self.root.manager_object.worker_dir+self.root.manager_object.env_name+"_saved_population.p" \
+        save_name = self.root.manager_object.model_dir+self.root.manager_object.env_name+"_saved_population.p" \
             if save_name is None else save_name
         pickle.dump(self.root.manager_object.agents, open(save_name, "wb"))
         print("population saved")
 
     def load_pop(self, load_name=None):
-        load_name = self.root.manager_object.worker_dir+self.root.manager_object.env_name+"_saved_population.p" \
+        load_name = self.root.manager_object.model_dir+self.root.manager_object.env_name+"_saved_population.p" \
             if load_name is None else load_name
         self.root.manager_object.agents = pickle.load(open(load_name, "rb"))
         print("population loaded")
@@ -476,6 +503,6 @@ class ControlWindow:
 
 
 if __name__ == "__main__":
-    manager = AgentManager(population=100, pool_size=0.1, network_layout=[6, 16, 16, 3], env_name="Acrobot-v1",
-                           continuous_action=False, episodes_per_agent=5, use_watchdog=-1, watchdog_penalty=0,
-                           generations=500, obs_scale=1, action_scale=1)
+    manager = AgentManager(population=100, pool_size=0.1, network_layout=[24, 16, 16, 4], env_name="BipedalWalker-v3",
+                           continuous_action=True, episodes_per_agent=10, use_watchdog=300, watchdog_penalty=100,
+                           generations=500, obs_scale=1, action_scale=1, n_procs=4)
