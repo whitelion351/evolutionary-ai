@@ -11,12 +11,14 @@ import tkinter as tk
 import pickle
 import os
 import psutil
+import socket
+import json
 
 
 class AgentManager:
     def __init__(self, population=50, network_layout=None, env_name=None, continuous_action=True, generations=999,
                  episodes_per_agent=1, pool_size=0.25, obs_scale=1, action_scale=1, input_nodes=2, output_nodes=2,
-                 timestep_limit=None, use_watchdog=-1, watchdog_penalty=0, n_procs=-1):
+                 timestep_limit=None, use_watchdog=0, watchdog_penalty=0, n_procs=-1, is_client=False):
         self.n_procs = psutil.cpu_count() if n_procs == -1 else n_procs
         self.watchdog_penalty = watchdog_penalty
         self.input_nodes = input_nodes
@@ -31,14 +33,20 @@ class AgentManager:
         self.use_watchdog = use_watchdog
         self.network_layout = network_layout
         self.episodes_per_agent = episodes_per_agent
-        self.cross_over_chance = 0.5
-        self.random_weight_chance = 0.01
-        self.mutate_chance = 0.1
-        self.max_mutate_amount = 0.2
+        self.cross_over_chance = 0.2
+        self.mutate_chance = 0.05
+        self.random_weight_chance = 0.1
+        self.max_mutate_amount = 0.1
         self.population_to_keep = int(self.total_population * pool_size)
         print(f"pool/population size {self.population_to_keep}/{self.total_population}")
         self.model_dir = "models/"
         self.worker_dir = "workers/"
+        self.bind_address = "0.0.0.0"
+        self.port = 8020
+        self.socket_timeout = 5
+        self.buffer_size = 2048
+        self.client_db = {}
+        self.is_client = is_client
         self.render_done = False
         self.render_watchdog = False
         self.render_best = False
@@ -54,15 +62,21 @@ class AgentManager:
         else:
             self.set_env(env_name)
 
-        self.agents = self.create_population()
-        self.scores = [0 for _ in range(self.total_population)]
-
         print(f"starting {self.n_procs} processes")
         for w in range(self.n_procs):
             proc = Process(name="worker"+str(w), target=self.worker, daemon=True, args=(w,))
             proc.start()
+        sleep(0.5)
 
-        sleep(1.0)
+        if not self.is_client:
+            self.agents = self.create_population()
+            self.scores = [0 for _ in range(self.total_population)]
+            self.network_thread = Thread(name="server_thread", target=self.server_thread_function, daemon=True)
+            self.network_thread.start()
+        else:
+            self.connect_to_server()
+        sleep(0.5)
+
         print("starting frontend")
         self.frontend = MainWindow(self)
         self.frontend.mainloop()
@@ -115,6 +129,109 @@ class AgentManager:
                 sleep(0.1)
             except (FileNotFoundError, EOFError):
                 sleep(0.1)
+
+    def server_thread_function(self):
+        print("starting server thread")
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind((self.bind_address, self.port))
+        s.listen(10)
+
+        print(f"AI server listening on address {self.bind_address} port {self.port}")
+
+        while True:
+            try:
+                client_socket, address = s.accept()
+                client_socket.settimeout(self.socket_timeout)
+                msg = client_socket.recv(self.buffer_size)
+                decoded_msg = msg.decode("utf-8").split(sep=":")
+                if decoded_msg[0] == "client":
+                    # print("Unit connecting from", address[0])
+                    self.talk_to_client(client_socket, address[0], decoded_msg)
+                    client_socket.close()
+                else:
+                    print("received unknown connection from", address[0], "sending response...")
+                    client_socket.send(bytes("alert "+address[0], "utf-8"))
+                    client_socket.close()
+            except (ConnectionError, socket.timeout, UnicodeDecodeError) as e:
+                print("Error in unit communication:", e)
+
+    def talk_to_client(self, client_socket, remote_address, client_msg):
+        if client_msg[1] == "connect":
+            result = self.send_agents_to_client(remote_address, client_socket)
+            if result == 0:
+                self.client_db[remote_address] = {"socket": client_socket}
+                print(f"added {remote_address} to client_db")
+
+    def get_client_socket(self):
+        # will return the client socket
+        pass
+
+    def send_agents_to_client(self, remote_address, client_socket):
+        data = [[agent.network, agent.biases] for agent in self.agents]
+        agents_bytes = json.dumps(data).encode("utf-8")
+        print(f"sending agents to {remote_address}")
+        msg = "ok:" + str(len(agents_bytes))
+        client_socket.send(bytes(msg, "utf-8"))
+        decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
+        if decoded_resp == "ok":
+            client_socket.sendall(agents_bytes)
+            decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
+            if decoded_resp == str(len(agents_bytes)):
+                print(f"client {remote_address} success")
+                client_socket.send(bytes("ok", "utf-8"))
+            else:
+                print(f"client {remote_address} unknown response - {decoded_resp}")
+                client_socket.send(bytes("closing", "utf-8"))
+                return 0
+        elif decoded_resp == "closing":
+            print("client ended connection early")
+            return 0
+        return 1
+
+    def connect_to_server(self):
+        print("starting client thread")
+
+        server_address = "192.168.0.8"
+        server_port = 8020
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((server_address, server_port))
+            s.settimeout(self.socket_timeout)
+            s.send(bytes("client:connect", "utf-8"))
+            msg = s.recv(self.buffer_size)
+            print(f"received {msg.decode('utf-8')} from server")
+            decoded_msg = msg.decode("utf-8").split(sep=":")
+            if decoded_msg[0] == "ok":
+                s.send(bytes("ok", "utf-8"))
+                agent_bytes = bytes()
+                print("receiving agent networks from server")
+                data_counter = 0
+                while data_counter < int(decoded_msg[1]):
+                    agent_bytes += s.recv(102400)
+                    data_counter = len(agent_bytes)
+                    if data_counter % 100000 == 0:
+                        print(f"receiving byte {data_counter}")
+                print("done receiving")
+                if len(agent_bytes) == int(decoded_msg[1]):
+                    s.send(bytes(str(len(agent_bytes)), "utf-8"))
+                    resp = s.recv(2).decode("utf-8")
+                    if resp == "ok":
+                        print("connect success")
+                        data = json.loads(agent_bytes.decode("utf-8"))
+                        self.agents = []
+                        for a in range(len(data)):
+                            agent = Agent(agent_id=a, network_layout=self.network_layout,
+                                          continuous_action=self.continuous_action,
+                                          input_nodes=self.input_nodes, output_nodes=self.output_nodes)
+                            agent.network = data[a][0]
+                            agent.biases = data[a][1]
+                            self.agents.append(agent)
+                        print(f"loaded {len(self.agents)} agents from server")
+                else:
+                    print("data length was not correct")
+                    s.send(bytes("closing", "utf-8"))
+        except (ConnectionError, socket.timeout, TimeoutError, OSError) as e:
+            print("server seems unavailable at", server_address, e)
 
     def train(self):
         print("begin training...")
@@ -189,7 +306,7 @@ class AgentManager:
             timestep += 1
             if timestep_limit is not None and timestep >= timestep_limit:
                 done = True
-            if self.use_watchdog != -1 and timestep != 0 and timestep % self.use_watchdog == 0:
+            if self.use_watchdog > 1 and timestep != 0 and timestep % self.use_watchdog == 0:
                 if agent_score <= old_agent_score:
                     # print(f"agent {agent.agent_id} died from watchdog")
                     done = True
@@ -229,9 +346,6 @@ class AgentManager:
                 if random() < self.cross_over_chance:
                     self.agents[p].network, self.agents[p].biases = self.cross_over(best_agents, best_agents)
                 self.agents[p].network, self.agents[p].biases = self.mutate_network([p])
-                if p == 0:
-                    debug_net = self.agents[p].biases
-                    # print(debug_net)
         return best_agents
 
     def cross_over(self, agent_list_a, agent_list_b):
@@ -266,12 +380,13 @@ class AgentManager:
                         if abs(_weight) > 1.0 or random() < self.random_weight_chance:
                             _weight = self.random_float()
                         chosen_network[layer][node][weight] = _weight
-            for bias in range(len(chosen_biases[layer])):
+            for bias_index in range(len(chosen_biases[layer])):
                 if 0 <= layer < len(chosen_network) - 1 and random() < self.mutate_chance:
-                    _bias = chosen_biases[layer][bias] + (self.random_float() * self.max_mutate_amount)
+                    _bias = chosen_biases[layer][bias_index] + (self.random_float() * self.max_mutate_amount)
                     if abs(_bias) > 1.0 or random() < self.random_weight_chance:
                         _bias = self.random_float()
-                    chosen_biases[layer][bias] = _bias
+                    # noinspection PyTypeChecker
+                    chosen_biases[layer][bias_index] = _bias
         return deepcopy(chosen_network), deepcopy(chosen_biases)
 
 
@@ -371,38 +486,39 @@ class ControlWindow:
         self.font = ("helvetica", 10)
         self.frame = tk.Frame(root, width=width, height=height, bg="#AAAAAA", bd=bd, relief=relief)
 
-        # The Start button (don't touch it)
-        self.start_train_button = tk.Button(self.frame, width=5, bg="#CCCCCC", text="START", command=self.start_train)
-        self.start_train_button.place(x=10, y=10)
+        if not self.root.manager_object.is_client:
+            # The Start button (don't touch it)
+            self.start_train_button = tk.Button(self.frame, width=5, bg="#CCCCCC", text="START", command=self.start_train)
+            self.start_train_button.place(x=10, y=10)
 
-        # Mutate controls
-        self.mutate_chance_title = tk.Label(self.frame, width=11, bg="#AAAAAA", text="Mutate Chance")
-        self.mutate_chance_title.place(x=10, y=52)
-        self.chance_down_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="-", command=self.chance_down_func)
-        self.chance_down_button.place(x=110, y=50)
-        self.mutate_chance_label_var = tk.StringVar()
-        self.mutate_chance_label_var.set(str(self.root.manager_object.mutate_chance))
-        self.mutate_chance_label = tk.Label(self.frame, width=5, textvariable=self.mutate_chance_label_var)
-        self.mutate_chance_label.place(x=128, y=52)
-        self.chance_up_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="+", command=self.chance_up_func)
-        self.chance_up_button.place(x=170, y=50)
+            # Mutate controls
+            self.mutate_chance_title = tk.Label(self.frame, width=11, bg="#AAAAAA", text="Mutate Chance")
+            self.mutate_chance_title.place(x=10, y=52)
+            self.chance_down_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="-", command=self.chance_down_func)
+            self.chance_down_button.place(x=110, y=50)
+            self.mutate_chance_label_var = tk.StringVar()
+            self.mutate_chance_label_var.set(str(self.root.manager_object.mutate_chance))
+            self.mutate_chance_label = tk.Label(self.frame, width=5, textvariable=self.mutate_chance_label_var)
+            self.mutate_chance_label.place(x=128, y=52)
+            self.chance_up_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="+", command=self.chance_up_func)
+            self.chance_up_button.place(x=170, y=50)
 
-        self.mutate_amount_title = tk.Label(self.frame, width=11, bg="#AAAAAA", text="Mutate Amount")
-        self.mutate_amount_title.place(x=10, y=92)
-        self.mutate_down_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="-", command=self.amount_down_func)
-        self.mutate_down_button.place(x=110, y=90)
-        self.mutate_amount_label_var = tk.StringVar()
-        self.mutate_amount_label_var.set(str(self.root.manager_object.max_mutate_amount))
-        self.mutate_amount_label = tk.Label(self.frame, width=5, textvariable=self.mutate_amount_label_var)
-        self.mutate_amount_label.place(x=128, y=92)
-        self.mutate_up_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="+", command=self.amount_up_func)
-        self.mutate_up_button.place(x=170, y=90)
+            self.mutate_amount_title = tk.Label(self.frame, width=11, bg="#AAAAAA", text="Mutate Amount")
+            self.mutate_amount_title.place(x=10, y=92)
+            self.mutate_down_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="-", command=self.amount_down_func)
+            self.mutate_down_button.place(x=110, y=90)
+            self.mutate_amount_label_var = tk.StringVar()
+            self.mutate_amount_label_var.set(str(self.root.manager_object.max_mutate_amount))
+            self.mutate_amount_label = tk.Label(self.frame, width=5, textvariable=self.mutate_amount_label_var)
+            self.mutate_amount_label.place(x=128, y=92)
+            self.mutate_up_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="+", command=self.amount_up_func)
+            self.mutate_up_button.place(x=170, y=90)
 
-        # Save and Load buttons
-        self.save_button = tk.Button(self.frame, width=5, text="SAVE", bg="#CCCCCC", command=self.save_pop)
-        self.save_button.place(x=150, y=10)
-        self.load_button = tk.Button(self.frame, width=5, text="LOAD", bg="#CCCCCC", command=self.load_pop)
-        self.load_button.place(x=210, y=10)
+            # Save and Load buttons
+            self.save_button = tk.Button(self.frame, width=5, text="SAVE", bg="#CCCCCC", command=self.save_pop)
+            self.save_button.place(x=150, y=10)
+            self.load_button = tk.Button(self.frame, width=5, text="LOAD", bg="#CCCCCC", command=self.load_pop)
+            self.load_button.place(x=210, y=10)
 
         # Render options
         self.render_title = tk.Label(self.frame, width=11, bg="#AAAAAA", text="Render Options")
@@ -440,25 +556,25 @@ class ControlWindow:
         self.train_thread = None
 
     def amount_down_func(self):
-        new_amount = self.root.manager_object.max_mutate_amount - 0.05
+        new_amount = self.root.manager_object.max_mutate_amount - 0.01
         self.root.manager_object.max_mutate_amount = new_amount
         self.mutate_amount_label_var.set(str(round(new_amount, ndigits=3)))
         print("\rmax mutate amount =", str(round(new_amount, ndigits=3)), end="")
 
     def amount_up_func(self):
-        new_amount = self.root.manager_object.max_mutate_amount + 0.05
+        new_amount = self.root.manager_object.max_mutate_amount + 0.01
         self.root.manager_object.max_mutate_amount = new_amount
         self.mutate_amount_label_var.set(str(round(new_amount, ndigits=3)))
         print("\rmax mutate amount =", str(round(new_amount, ndigits=3)), end="")
 
     def chance_down_func(self):
-        new_amount = self.root.manager_object.mutate_chance - 0.05
+        new_amount = self.root.manager_object.mutate_chance - 0.01
         self.root.manager_object.mutate_chance = new_amount
         self.mutate_chance_label_var.set(str(round(new_amount, ndigits=3)))
         print("\rmutate chance =", str(round(new_amount, ndigits=3)), end="")
 
     def chance_up_func(self):
-        new_amount = self.root.manager_object.mutate_chance + 0.05
+        new_amount = self.root.manager_object.mutate_chance + 0.01
         self.root.manager_object.mutate_chance = new_amount
         self.mutate_chance_label_var.set(str(round(new_amount, ndigits=3)))
         print("\rmutate chance =", str(round(new_amount, ndigits=3)), end="")
@@ -503,6 +619,6 @@ class ControlWindow:
 
 
 if __name__ == "__main__":
-    manager = AgentManager(population=100, pool_size=0.1, network_layout=[24, 16, 16, 4], env_name="BipedalWalker-v3",
-                           continuous_action=True, episodes_per_agent=10, use_watchdog=300, watchdog_penalty=100,
-                           generations=500, obs_scale=1, action_scale=1, n_procs=4)
+    manager = AgentManager(population=100, pool_size=0.1, network_layout=[8, 16, 16, 4], env_name="LunarLander-v2",
+                           continuous_action=False, episodes_per_agent=3, use_watchdog=500, watchdog_penalty=100,
+                           generations=500, obs_scale=1, action_scale=1, n_procs=2)
