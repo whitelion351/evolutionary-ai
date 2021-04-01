@@ -8,11 +8,11 @@ from time import sleep
 import gym
 import numpy as np
 import tkinter as tk
-import pickle
 import os
 import psutil
 import socket
 import json
+import pickle
 
 
 class AgentManager:
@@ -45,6 +45,10 @@ class AgentManager:
         self.port = 8020
         self.socket_timeout = 5
         self.buffer_size = 2048
+        self.next_agent = 0
+        self.current_generation = 0
+        self.completed_agents = 0
+        self.is_training = False
         self.client_db = {}
         self.is_client = is_client
         self.render_done = False
@@ -70,11 +74,15 @@ class AgentManager:
 
         if not self.is_client:
             self.agents = self.create_population()
-            self.scores = [0 for _ in range(self.total_population)]
+            self.scores = [0.0 for _ in range(self.total_population)]
             self.network_thread = Thread(name="server_thread", target=self.server_thread_function, daemon=True)
             self.network_thread.start()
         else:
-            self.connect_to_server()
+            server_address = "192.168.0.8"
+            server_port = 8020
+            self.network_thread = Thread(name="client_thread", target=self.client_thread_function, daemon=True,
+                                         args=[server_address, server_port])
+            self.network_thread.start()
         sleep(0.5)
 
         print("starting frontend")
@@ -145,12 +153,11 @@ class AgentManager:
                 msg = client_socket.recv(self.buffer_size)
                 decoded_msg = msg.decode("utf-8").split(sep=":")
                 if decoded_msg[0] == "client":
-                    # print("Unit connecting from", address[0])
                     self.talk_to_client(client_socket, address[0], decoded_msg)
                     client_socket.close()
                 else:
-                    print("received unknown connection from", address[0], "sending response...")
-                    client_socket.send(bytes("alert "+address[0], "utf-8"))
+                    print("unknown connection from", address[0], "sending alert response...")
+                    client_socket.send(bytes(f"alert {address[0]}", "utf-8"))
                     client_socket.close()
             except (ConnectionError, socket.timeout, UnicodeDecodeError) as e:
                 print("Error in unit communication:", e)
@@ -158,48 +165,116 @@ class AgentManager:
     def talk_to_client(self, client_socket, remote_address, client_msg):
         if client_msg[1] == "connect":
             result = self.send_agents_to_client(remote_address, client_socket)
-            if result == 0:
-                self.client_db[remote_address] = {"socket": client_socket}
+            if result == 0 and remote_address not in self.client_db.keys():
+                self.client_db[remote_address] = {"proc_ids": []}
                 print(f"added {remote_address} to client_db")
+        elif client_msg[1] == "get":
+            self.send_work_to_client(remote_address, client_socket)
+        elif client_msg[1] == "put":
+            # print(f"client {remote_address} agent {client_msg[2]} score {client_msg[3]} generation {client_msg[4]}")
+            self.get_result_from_client(remote_address, client_socket, client_msg)
 
-    def get_client_socket(self):
-        # will return the client socket
-        pass
+    def send_work_to_client(self, remote_address, client_socket):
+        if self.is_training is False or self.next_agent >= self.total_population:
+            work_id = -1
+        else:
+            work_id = self.next_agent
+            self.next_agent += 1
+        print(f"sending agent_id {work_id} to {remote_address}")
+        msg = f"ok:{str(work_id)}"
+        client_socket.send(bytes(msg, "utf-8"))
+        decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
+        if decoded_resp == str(work_id):
+            client_socket.send(bytes("ok", "utf-8"))
+        else:
+            print(f"client {remote_address} invalid response - '{decoded_resp}'")
+            client_socket.send(bytes("closing", "utf-8"))
+            return 1
+        return 0
+
+    def get_result_from_client(self, remote_address, client_socket, client_msg):
+        agent_id = int(client_msg[2])
+        score = float(client_msg[3])
+        generation = int(client_msg[4])
+        if generation != self.current_generation:
+            print(f"client {remote_address} sent expired results")
+            client_socket.send(bytes("expired", "utf-8"))
+        else:
+            self.agents[agent_id].score = score
+            self.scores[agent_id] = score
+            self.completed_agents += 1
+            client_socket.send(bytes("ok", "utf-8"))
 
     def send_agents_to_client(self, remote_address, client_socket):
         data = [[agent.network, agent.biases] for agent in self.agents]
         agents_bytes = json.dumps(data).encode("utf-8")
         print(f"sending agents to {remote_address}")
-        msg = "ok:" + str(len(agents_bytes))
+        msg = f"ok:{str(len(agents_bytes))}:{self.current_generation}"
         client_socket.send(bytes(msg, "utf-8"))
         decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
         if decoded_resp == "ok":
             client_socket.sendall(agents_bytes)
             decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
             if decoded_resp == str(len(agents_bytes)):
-                print(f"client {remote_address} success")
                 client_socket.send(bytes("ok", "utf-8"))
             else:
                 print(f"client {remote_address} unknown response - {decoded_resp}")
                 client_socket.send(bytes("closing", "utf-8"))
-                return 0
+                return 1
         elif decoded_resp == "closing":
             print("client ended connection early")
-            return 0
-        return 1
+            return 1
+        return 0
 
-    def connect_to_server(self):
+    def client_thread_function(self, server_address, server_port):
         print("starting client thread")
+        proc_ids = [-1 for _ in range(self.n_procs)]
+        while True:
+            current_gen = self.connect_to_server(server_address, server_port)
+            while current_gen is not None:
+                self.current_generation = current_gen
+                for proc_id in range(len(proc_ids)):
+                    if proc_ids[proc_id] == -1:
+                        agent_index = self.client_get_work(server_address, server_port, current_gen)
+                        if agent_index is not None and agent_index != -1:
+                            print(f"client worker{proc_id} got agent {agent_index}")
+                            proc_ids[proc_id] = agent_index
+                            do_render = True if self.render_all_agents else False
+                            pickle.dump([self.agents[agent_index],
+                                         {"agent_id": self.next_agent, "eps": self.episodes_per_agent,
+                                          "do_render": do_render, "render_watchdog": self.render_watchdog,
+                                          "render_done": self.render_done, "all_eps": self.render_all_episodes}],
+                                        open(f"{self.worker_dir}worker{proc_id}", "wb"))
+                        else:
+                            print("refreshing agents")
+                            current_gen = None
+                            break
+                    else:
+                        try:
+                            result = pickle.load(open(f"{self.worker_dir}worker{proc_id}result", "rb"))
+                            if result is not None:
+                                self.client_send_result(server_address, server_port, proc_ids[proc_id], result,
+                                                        current_gen)
+                                proc_ids[proc_id] = -1
+                                self.remove_file(f"{self.worker_dir}worker{proc_id}result")
+                            else:
+                                do_render = True if self.render_all_agents else False
+                                pickle.dump([self.agents[proc_ids[proc_id]],
+                                             {"agent_id": self.next_agent, "eps": self.episodes_per_agent,
+                                              "do_render": do_render, "render_watchdog": self.render_watchdog,
+                                              "render_done": self.render_done, "all_eps": self.render_all_episodes}],
+                                            open(f"{self.worker_dir}worker{proc_id}", "wb"))
+                        except FileNotFoundError:
+                            sleep(0.3)
+            sleep(1.0)
 
-        server_address = "192.168.0.8"
-        server_port = 8020
+    def connect_to_server(self, server_address, server_port):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((server_address, server_port))
             s.settimeout(self.socket_timeout)
             s.send(bytes("client:connect", "utf-8"))
             msg = s.recv(self.buffer_size)
-            print(f"received {msg.decode('utf-8')} from server")
             decoded_msg = msg.decode("utf-8").split(sep=":")
             if decoded_msg[0] == "ok":
                 s.send(bytes("ok", "utf-8"))
@@ -209,14 +284,10 @@ class AgentManager:
                 while data_counter < int(decoded_msg[1]):
                     agent_bytes += s.recv(102400)
                     data_counter = len(agent_bytes)
-                    if data_counter % 100000 == 0:
-                        print(f"receiving byte {data_counter}")
-                print("done receiving")
                 if len(agent_bytes) == int(decoded_msg[1]):
                     s.send(bytes(str(len(agent_bytes)), "utf-8"))
                     resp = s.recv(2).decode("utf-8")
                     if resp == "ok":
-                        print("connect success")
                         data = json.loads(agent_bytes.decode("utf-8"))
                         self.agents = []
                         for a in range(len(data)):
@@ -226,34 +297,76 @@ class AgentManager:
                             agent.network = data[a][0]
                             agent.biases = data[a][1]
                             self.agents.append(agent)
-                        print(f"loaded {len(self.agents)} agents from server")
+                        print(f"received {len(self.agents)} agents for generation {decoded_msg[2]}")
+                        return decoded_msg[2]
                 else:
                     print("data length was not correct")
                     s.send(bytes("closing", "utf-8"))
         except (ConnectionError, socket.timeout, TimeoutError, OSError) as e:
             print("server seems unavailable at", server_address, e)
+        return None
+
+    def client_get_work(self, server_address, server_port, generation):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((server_address, server_port))
+            s.settimeout(self.socket_timeout)
+            s.send(bytes(f"client:get:{generation}", "utf-8"))
+            msg = s.recv(self.buffer_size)
+            decoded_msg = msg.decode("utf-8").split(sep=":")
+            if decoded_msg[0] == "ok":
+                s.send(bytes(decoded_msg[1], "utf-8"))
+                resp = s.recv(2).decode("utf-8")
+                if resp == "ok":
+                    if int(decoded_msg[1]) != "-1":
+                        return int(decoded_msg[1])
+                    return None
+            else:
+                return None
+        except (ConnectionError, socket.timeout, TimeoutError, OSError) as e:
+            print("server seems unavailable at", server_address, e)
+        return None
+
+    def client_send_result(self, server_address, server_port, agent_id, score, generation):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((server_address, server_port))
+            s.settimeout(self.socket_timeout)
+            s.send(bytes(f"client:put:{agent_id}:{score}:{generation}", "utf-8"))
+            msg = s.recv(self.buffer_size)
+            decoded_msg = msg.decode("utf-8")
+            if decoded_msg == "ok":
+                return 0
+            else:
+                print(f"client_send_results failed. server responded with {decoded_msg}")
+                return 1
+        except (ConnectionError, socket.timeout, TimeoutError, OSError) as e:
+            print("server seems unavailable at", server_address, e)
+            return 1
 
     def train(self):
         print("begin training...")
-        self.scores = [0 for _ in range(self.total_population)]
+        self.is_training = True
+        self.scores = [0.0 for _ in range(self.total_population)]
         best_agents = []
         for e in range(self.generations):
-            next_agent = 0
-            completed_agents = 0
+            self.current_generation = e
+            self.next_agent = 0
+            self.completed_agents = 0
             proc_ids = [-1 for _ in range(self.n_procs)]
-            while completed_agents < self.total_population:
+            while self.completed_agents < self.total_population:
                 for proc_id in range(self.n_procs):
-                    if next_agent < self.total_population and proc_ids[proc_id] == -1:
-                        do_render = True if next_agent in best_agents[:3] and self.render_best \
+                    if self.next_agent < self.total_population and proc_ids[proc_id] == -1:
+                        do_render = True if self.next_agent in best_agents[:3] and self.render_best \
                             or self.render_all_agents \
                             else False
-                        pickle.dump([self.agents[next_agent],
-                                     {"agent_id": next_agent, "eps": self.episodes_per_agent, "do_render": do_render,
-                                      "render_watchdog": self.render_watchdog, "render_done": self.render_done,
-                                      "all_eps": self.render_all_episodes}],
+                        pickle.dump([self.agents[self.next_agent],
+                                     {"agent_id": self.next_agent, "eps": self.episodes_per_agent,
+                                      "do_render": do_render, "render_watchdog": self.render_watchdog,
+                                      "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                     open(self.worker_dir+"worker"+str(proc_id), "wb"))
-                        proc_ids[proc_id] = next_agent
-                        next_agent += 1
+                        proc_ids[proc_id] = self.next_agent
+                        self.next_agent += 1
                         sleep(0.1)
                     else:
                         try:
@@ -268,18 +381,19 @@ class AgentManager:
                             else:
                                 self.scores[proc_ids[proc_id]] = agent_score
                                 self.agents[proc_ids[proc_id]].score = agent_score
-                                completed_agents += 1
+                                self.completed_agents += 1
                                 proc_ids[proc_id] = -1
                                 self.remove_file(self.worker_dir+"worker"+str(proc_id)+"result")
                         except (FileNotFoundError, EOFError):
                             sleep(0.1)
-                a_status = f"gen: {e+1} agent: {next_agent-1}"
+                a_status = f"gen: {e+1} agent: {self.next_agent-1}"
                 self.frontend.control_window.status1_label_var.set(a_status)
             best_agents = self.process_agents(e)
-            self.scores = [0 for _ in range(self.total_population)]
+            self.scores = [0.0 for _ in range(self.total_population)]
             for a in self.agents:
                 a.reset()
         self.frontend.control_window.train_thread = None
+        self.is_training = False
 
     def play_episode(self, agent, env, do_render=False, render_watchdog=False, render_done=False, timestep_limit=None):
         agent_score = 0
@@ -488,31 +602,31 @@ class ControlWindow:
 
         if not self.root.manager_object.is_client:
             # The Start button (don't touch it)
-            self.start_train_button = tk.Button(self.frame, width=5, bg="#CCCCCC", text="START", command=self.start_train)
-            self.start_train_button.place(x=10, y=10)
+            self.start_button = tk.Button(self.frame, width=5, bg="#CCCCCC", text="START", command=self.start_train)
+            self.start_button.place(x=10, y=10)
 
             # Mutate controls
             self.mutate_chance_title = tk.Label(self.frame, width=11, bg="#AAAAAA", text="Mutate Chance")
             self.mutate_chance_title.place(x=10, y=52)
-            self.chance_down_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="-", command=self.chance_down_func)
-            self.chance_down_button.place(x=110, y=50)
+            self.chance_down = tk.Button(self.frame, width=1, bg="#CCCCCC", text="-", command=self.chance_down_func)
+            self.chance_down.place(x=110, y=50)
             self.mutate_chance_label_var = tk.StringVar()
             self.mutate_chance_label_var.set(str(self.root.manager_object.mutate_chance))
             self.mutate_chance_label = tk.Label(self.frame, width=5, textvariable=self.mutate_chance_label_var)
             self.mutate_chance_label.place(x=128, y=52)
-            self.chance_up_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="+", command=self.chance_up_func)
-            self.chance_up_button.place(x=170, y=50)
+            self.chance_up = tk.Button(self.frame, width=1, bg="#CCCCCC", text="+", command=self.chance_up_func)
+            self.chance_up.place(x=170, y=50)
 
             self.mutate_amount_title = tk.Label(self.frame, width=11, bg="#AAAAAA", text="Mutate Amount")
             self.mutate_amount_title.place(x=10, y=92)
-            self.mutate_down_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="-", command=self.amount_down_func)
-            self.mutate_down_button.place(x=110, y=90)
+            self.mutate_down = tk.Button(self.frame, width=1, bg="#CCCCCC", text="-", command=self.amount_down_func)
+            self.mutate_down.place(x=110, y=90)
             self.mutate_amount_label_var = tk.StringVar()
             self.mutate_amount_label_var.set(str(self.root.manager_object.max_mutate_amount))
             self.mutate_amount_label = tk.Label(self.frame, width=5, textvariable=self.mutate_amount_label_var)
             self.mutate_amount_label.place(x=128, y=92)
-            self.mutate_up_button = tk.Button(self.frame, width=1, bg="#CCCCCC", text="+", command=self.amount_up_func)
-            self.mutate_up_button.place(x=170, y=90)
+            self.mutate_up = tk.Button(self.frame, width=1, bg="#CCCCCC", text="+", command=self.amount_up_func)
+            self.mutate_up.place(x=170, y=90)
 
             # Save and Load buttons
             self.save_button = tk.Button(self.frame, width=5, text="SAVE", bg="#CCCCCC", command=self.save_pop)
@@ -523,20 +637,20 @@ class ControlWindow:
         # Render options
         self.render_title = tk.Label(self.frame, width=11, bg="#AAAAAA", text="Render Options")
         self.render_title.place(x=440, y=12)
-        self.render_done_checkbox = tk.Checkbutton(self.frame, width=5, height=1, bg="#AAAAAA",
-                                                   text="Done", command=self.toggle_render_done)
+        self.render_done_checkbox = tk.Checkbutton(self.frame, width=5, height=1, bg="#AAAAAA", text="Done",
+                                                   command=self.toggle_render_done)
         self.render_done_checkbox.place(x=310, y=35)
-        self.render_watchdog_checkbox = tk.Checkbutton(self.frame, width=7, height=1, bg="#AAAAAA",
-                                                       text="Watchdog", command=self.toggle_render_watchdog)
+        self.render_watchdog_checkbox = tk.Checkbutton(self.frame, width=7, height=1, bg="#AAAAAA", text="Watchdog",
+                                                       command=self.toggle_render_watchdog)
         self.render_watchdog_checkbox.place(x=375, y=35)
-        self.render_best_checkbox = tk.Checkbutton(self.frame, width=3, height=1, bg="#AAAAAA",
-                                                   text="Best 3", command=self.toggle_render_best)
+        self.render_best_checkbox = tk.Checkbutton(self.frame, width=3, height=1, bg="#AAAAAA", text="Best 3",
+                                                   command=self.toggle_render_best)
         self.render_best_checkbox.place(x=465, y=35)
-        self.render_all_agents_checkbox = tk.Checkbutton(self.frame, width=5, height=1, bg="#AAAAAA",
-                                                         text="Agents", command=self.toggle_render_all_agents)
+        self.render_all_agents_checkbox = tk.Checkbutton(self.frame, width=5, height=1, bg="#AAAAAA", text="Agents",
+                                                         command=self.toggle_render_all_agents)
         self.render_all_agents_checkbox.place(x=525, y=35)
-        self.render_all_episodes_checkbox = tk.Checkbutton(self.frame, width=5, height=1, bg="#AAAAAA",
-                                                           text="Episodes", command=self.toggle_render_all_episodes)
+        self.render_all_episodes_checkbox = tk.Checkbutton(self.frame, width=5, height=1, bg="#AAAAAA", text="Episodes",
+                                                           command=self.toggle_render_all_episodes)
         self.render_all_episodes_checkbox.place(x=600, y=35)
 
         # Status Label1
@@ -620,5 +734,5 @@ class ControlWindow:
 
 if __name__ == "__main__":
     manager = AgentManager(population=100, pool_size=0.1, network_layout=[8, 16, 16, 4], env_name="LunarLander-v2",
-                           continuous_action=False, episodes_per_agent=3, use_watchdog=500, watchdog_penalty=100,
-                           generations=500, obs_scale=1, action_scale=1, n_procs=2)
+                           continuous_action=False, episodes_per_agent=10, use_watchdog=500, watchdog_penalty=100,
+                           generations=500, obs_scale=1, action_scale=1, n_procs=4)
