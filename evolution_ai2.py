@@ -176,7 +176,8 @@ class AgentManager:
 
     def send_work_to_client(self, remote_address, client_socket, client_msg):
         print(f"{remote_address} requesting work for generation {client_msg[2]}")
-        if self.is_training is False or self.next_agent >= self.total_population or client_msg[2] != str(self.current_generation):
+        if self.is_training is False or self.next_agent >= self.total_population \
+                or client_msg[2] != str(self.current_generation):
             work_id = -1
         else:
             work_id = self.next_agent
@@ -278,7 +279,7 @@ class AgentManager:
                                               "do_render": do_render, "render_watchdog": self.render_watchdog,
                                               "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                             open(f"{self.worker_dir}worker{proc_id}", "wb"))
-                        except FileNotFoundError:
+                        except (FileNotFoundError, EOFError):
                             sleep(0.3)
                 print(f"proc_ids: {proc_ids}")
             sleep(1.0)
