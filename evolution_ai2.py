@@ -81,7 +81,7 @@ class AgentManager:
             self.network_thread.start()
         else:
             self.network_thread = Thread(name="client_thread", target=self.client_thread_function, daemon=True,
-                                         args=[server_address, server_port])
+                                         args=[self.server_address, self.server_port])
             self.network_thread.start()
         sleep(0.5)
 
