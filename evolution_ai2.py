@@ -33,7 +33,7 @@ class AgentManager:
         self.use_watchdog = use_watchdog
         self.network_layout = network_layout
         self.episodes_per_agent = episodes_per_agent
-        self.cross_over_chance = 0.2
+        self.cross_over_chance = 0.1
         self.mutate_chance = 0.05
         self.random_weight_chance = 0.1
         self.max_mutate_amount = 0.1
@@ -42,7 +42,9 @@ class AgentManager:
         self.model_dir = "models/"
         self.worker_dir = "workers/"
         self.bind_address = "0.0.0.0"
-        self.port = 8020
+        self.port = 8012
+        self.server_address = "192.168.0.8"
+        self.server_port = 8012
         self.socket_timeout = 5
         self.buffer_size = 2048
         self.next_agent = 0
@@ -70,7 +72,7 @@ class AgentManager:
         for w in range(self.n_procs):
             proc = Process(name="worker"+str(w), target=self.worker, daemon=True, args=(w,))
             proc.start()
-        sleep(0.5)
+            sleep(0.5)
 
         if not self.is_client:
             self.agents = self.create_population()
@@ -78,8 +80,6 @@ class AgentManager:
             self.network_thread = Thread(name="server_thread", target=self.server_thread_function, daemon=True)
             self.network_thread.start()
         else:
-            server_address = "192.168.0.8"
-            server_port = 8020
             self.network_thread = Thread(name="client_thread", target=self.client_thread_function, daemon=True,
                                          args=[server_address, server_port])
             self.network_thread.start()
@@ -166,21 +166,25 @@ class AgentManager:
         if client_msg[1] == "connect":
             result = self.send_agents_to_client(remote_address, client_socket)
             if result == 0 and remote_address not in self.client_db.keys():
-                self.client_db[remote_address] = {"proc_ids": []}
+                self.client_db[remote_address] = []
                 print(f"added {remote_address} to client_db")
         elif client_msg[1] == "get":
-            self.send_work_to_client(remote_address, client_socket)
+            self.send_work_to_client(remote_address, client_socket, client_msg)
         elif client_msg[1] == "put":
             # print(f"client {remote_address} agent {client_msg[2]} score {client_msg[3]} generation {client_msg[4]}")
             self.get_result_from_client(remote_address, client_socket, client_msg)
 
-    def send_work_to_client(self, remote_address, client_socket):
-        if self.is_training is False or self.next_agent >= self.total_population:
+    def send_work_to_client(self, remote_address, client_socket, client_msg):
+        print(f"{remote_address} requesting work for generation {client_msg[2]}")
+        if self.is_training is False or self.next_agent >= self.total_population or client_msg[2] != str(self.current_generation):
             work_id = -1
         else:
             work_id = self.next_agent
             self.next_agent += 1
         print(f"sending agent_id {work_id} to {remote_address}")
+        if work_id != -1:
+            self.client_db[remote_address].append(work_id)
+        print(self.client_db[remote_address])
         msg = f"ok:{str(work_id)}"
         client_socket.send(bytes(msg, "utf-8"))
         decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
@@ -199,11 +203,18 @@ class AgentManager:
         if generation != self.current_generation:
             print(f"client {remote_address} sent expired results")
             client_socket.send(bytes("expired", "utf-8"))
+        elif agent_id not in self.client_db[remote_address]:
+            print(f"client {remote_address} gave results for agent {agent_id} "
+                  f"which is not in {self.client_db[remote_address]}")
+            client_socket.send(bytes("invalid", "utf-8"))
+            self.client_db[remote_address] = []
         else:
+            print(f"client {remote_address} gave score {score} for agent {agent_id} generation {generation}")
             self.agents[agent_id].score = score
             self.scores[agent_id] = score
             self.completed_agents += 1
             client_socket.send(bytes("ok", "utf-8"))
+            self.client_db[remote_address].remove(agent_id)
 
     def send_agents_to_client(self, remote_address, client_socket):
         data = [[agent.network, agent.biases] for agent in self.agents]
@@ -231,13 +242,14 @@ class AgentManager:
         proc_ids = [-1 for _ in range(self.n_procs)]
         while True:
             current_gen = self.connect_to_server(server_address, server_port)
+            self.current_generation = current_gen
             while current_gen is not None:
-                self.current_generation = current_gen
                 for proc_id in range(len(proc_ids)):
                     if proc_ids[proc_id] == -1:
+                        print(f"requesting work for generation {current_gen}")
                         agent_index = self.client_get_work(server_address, server_port, current_gen)
                         if agent_index is not None and agent_index != -1:
-                            print(f"client worker{proc_id} got agent {agent_index}")
+                            print(f"worker{proc_id} got agent {agent_index}")
                             proc_ids[proc_id] = agent_index
                             do_render = True if self.render_all_agents else False
                             pickle.dump([self.agents[agent_index],
@@ -246,13 +258,15 @@ class AgentManager:
                                           "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                         open(f"{self.worker_dir}worker{proc_id}", "wb"))
                         else:
-                            print("refreshing agents")
-                            current_gen = None
-                            break
+                            if proc_ids == [-1, -1, -1, -1]:
+                                print("refreshing agents")
+                                current_gen = None
+                                break
                     else:
                         try:
                             result = pickle.load(open(f"{self.worker_dir}worker{proc_id}result", "rb"))
                             if result is not None:
+                                print(f"worker{proc_id} ")
                                 self.client_send_result(server_address, server_port, proc_ids[proc_id], result,
                                                         current_gen)
                                 proc_ids[proc_id] = -1
@@ -266,6 +280,7 @@ class AgentManager:
                                             open(f"{self.worker_dir}worker{proc_id}", "wb"))
                         except FileNotFoundError:
                             sleep(0.3)
+                print(f"proc_ids: {proc_ids}")
             sleep(1.0)
 
     def connect_to_server(self, server_address, server_port):
@@ -336,6 +351,7 @@ class AgentManager:
             msg = s.recv(self.buffer_size)
             decoded_msg = msg.decode("utf-8")
             if decoded_msg == "ok":
+                print(f"sending score {score} for agent {agent_id} generation {generation}")
                 return 0
             else:
                 print(f"client_send_results failed. server responded with {decoded_msg}")
@@ -360,13 +376,14 @@ class AgentManager:
                         do_render = True if self.next_agent in best_agents[:3] and self.render_best \
                             or self.render_all_agents \
                             else False
-                        pickle.dump([self.agents[self.next_agent],
-                                     {"agent_id": self.next_agent, "eps": self.episodes_per_agent,
+                        next_id = self.next_agent
+                        self.next_agent += 1
+                        proc_ids[proc_id] = next_id
+                        pickle.dump([self.agents[next_id],
+                                     {"agent_id": next_id, "eps": self.episodes_per_agent,
                                       "do_render": do_render, "render_watchdog": self.render_watchdog,
                                       "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                     open(self.worker_dir+"worker"+str(proc_id), "wb"))
-                        proc_ids[proc_id] = self.next_agent
-                        self.next_agent += 1
                         sleep(0.1)
                     else:
                         try:
@@ -379,13 +396,18 @@ class AgentManager:
                                               "all_eps": self.render_all_episodes}],
                                             open(self.worker_dir+"worker" + str(proc_id), "wb"))
                             else:
+                                print(f"worker{proc_id} gave score {agent_score} for agent {proc_ids[proc_id]} "
+                                      f"generation {self.current_generation}")
+
                                 self.scores[proc_ids[proc_id]] = agent_score
                                 self.agents[proc_ids[proc_id]].score = agent_score
                                 self.completed_agents += 1
                                 proc_ids[proc_id] = -1
                                 self.remove_file(self.worker_dir+"worker"+str(proc_id)+"result")
                         except (FileNotFoundError, EOFError):
+                            # print("could not read", self.worker_dir+"worker"+str(proc_id)+"result")
                             sleep(0.1)
+                print(f"proc_ids: {proc_ids}")
                 a_status = f"gen: {e+1} agent: {self.next_agent-1}"
                 self.frontend.control_window.status1_label_var.set(a_status)
             best_agents = self.process_agents(e)
