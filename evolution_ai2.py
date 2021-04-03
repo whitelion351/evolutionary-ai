@@ -33,10 +33,10 @@ class AgentManager:
         self.use_watchdog = use_watchdog
         self.network_layout = network_layout
         self.episodes_per_agent = episodes_per_agent
-        self.cross_over_chance = 0.1
-        self.mutate_chance = 0.05
-        self.random_weight_chance = 0.1
-        self.max_mutate_amount = 0.1
+        self.cross_over_chance = 0.5
+        self.mutate_chance = 0.2
+        self.random_weight_chance = 0.01
+        self.max_mutate_amount = 0.2
         self.population_to_keep = int(self.total_population * pool_size)
         print(f"pool/population size {self.population_to_keep}/{self.total_population}")
         self.model_dir = "models/"
@@ -208,7 +208,6 @@ class AgentManager:
             print(f"client {remote_address} gave results for agent {agent_id} "
                   f"which is not in {self.client_db[remote_address]}")
             client_socket.send(bytes("invalid", "utf-8"))
-            self.client_db[remote_address] = []
         else:
             # print(f"client {remote_address} gave score {score} for agent {agent_id} generation {generation}")
             self.agents[agent_id].score = score
@@ -241,6 +240,7 @@ class AgentManager:
     def client_thread_function(self, server_address, server_port):
         print("starting client thread")
         proc_ids = [-1 for _ in range(self.n_procs)]
+        last_ui_update_time = time()
         while True:
             current_gen = self.connect_to_server(server_address, server_port)
             self.current_generation = current_gen
@@ -282,6 +282,9 @@ class AgentManager:
                         except (FileNotFoundError, EOFError):
                             pass
                 sleep(0.1)
+                if time() - last_ui_update_time > 1:
+                    last_ui_update_time = time()
+                    self.update_ui(current_gen, proc_ids)
             sleep(2.0)
 
     def connect_to_server(self, server_address, server_port):
@@ -366,6 +369,7 @@ class AgentManager:
         self.is_training = True
         self.scores = [0.0 for _ in range(self.total_population)]
         best_agents = []
+        last_ui_update_time = time()
         for e in range(self.generations):
             self.current_generation = e
             self.next_agent = 0
@@ -407,14 +411,24 @@ class AgentManager:
                         except (FileNotFoundError, EOFError):
                             pass
                 sleep(0.1)
-                a_status = f"gen: {e+1} agent: {self.next_agent-1}"
-                self.frontend.control_window.status1_label_var.set(a_status)
+                if time() - last_ui_update_time > 1:
+                    self.update_ui(e, proc_ids)
+                    last_ui_update_time = time()
             best_agents = self.process_agents(e)
             self.scores = [0.0 for _ in range(self.total_population)]
             for a in self.agents:
                 a.reset()
         self.frontend.control_window.train_thread = None
         self.is_training = False
+
+    def update_ui(self, gen, current_agents):
+        running_local_agents = [x for x in current_agents]
+        running_remote_agents = []
+        for key in self.client_db.keys():
+            for p_id in self.client_db[key]:
+                running_remote_agents.append(p_id)
+        a_status = f"gen: {gen} running agents: {running_local_agents}{running_remote_agents}"
+        self.frontend.control_window.status1_label_var.set(a_status)
 
     def play_episode(self, agent, env, do_render=False, render_watchdog=False, render_done=False, timestep_limit=None):
         agent_score = 0
@@ -480,7 +494,9 @@ class AgentManager:
             if p not in best_agents:
                 if random() < self.cross_over_chance:
                     self.agents[p].network, self.agents[p].biases = self.cross_over(best_agents, best_agents)
-                self.agents[p].network, self.agents[p].biases = self.mutate_network([p])
+                    self.agents[p].network, self.agents[p].biases = self.mutate_network([p])
+                else:
+                    self.agents[p].network, self.agents[p].biases = self.mutate_network(best_agents)
         return best_agents
 
     def cross_over(self, agent_list_a, agent_list_b):
@@ -520,7 +536,6 @@ class AgentManager:
                     _bias = chosen_biases[layer][bias_index] + (self.random_float() * self.max_mutate_amount)
                     if abs(_bias) > 1.0 or random() < self.random_weight_chance:
                         _bias = self.random_float()
-                    # noinspection PyTypeChecker
                     chosen_biases[layer][bias_index] = _bias
         return deepcopy(chosen_network), deepcopy(chosen_biases)
 
@@ -754,6 +769,6 @@ class ControlWindow:
 
 
 if __name__ == "__main__":
-    manager = AgentManager(population=100, pool_size=0.1, network_layout=[8, 16, 16, 4], env_name="LunarLander-v2",
-                           continuous_action=False, episodes_per_agent=10, use_watchdog=500, watchdog_penalty=100,
+    manager = AgentManager(population=100, pool_size=0.1, network_layout=[8, 16, 16, 2], env_name="LunarLanderContinuous-v2",
+                           continuous_action=True, episodes_per_agent=10, use_watchdog=500, watchdog_penalty=100,
                            generations=500, obs_scale=1, action_scale=1, n_procs=4)
