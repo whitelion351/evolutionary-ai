@@ -45,7 +45,7 @@ class AgentManager:
         self.port = 8012
         self.server_address = "192.168.0.8"
         self.server_port = 8012
-        self.socket_timeout = 5
+        self.socket_timeout = 10
         self.buffer_size = 2048
         self.next_agent = 0
         self.current_generation = 0
@@ -160,7 +160,7 @@ class AgentManager:
                     client_socket.send(bytes(f"alert {address[0]}", "utf-8"))
                     client_socket.close()
             except (ConnectionError, socket.timeout, UnicodeDecodeError) as e:
-                print("Error in unit communication:", e)
+                print("Error in client communication:", e)
 
     def talk_to_client(self, client_socket, remote_address, client_msg):
         if client_msg[1] == "connect":
@@ -175,17 +175,17 @@ class AgentManager:
             self.get_result_from_client(remote_address, client_socket, client_msg)
 
     def send_work_to_client(self, remote_address, client_socket, client_msg):
-        print(f"{remote_address} requesting work for generation {client_msg[2]}")
+        # print(f"{remote_address} requesting work for generation {client_msg[2]}")
         if self.is_training is False or self.next_agent >= self.total_population \
                 or client_msg[2] != str(self.current_generation):
             work_id = -1
         else:
             work_id = self.next_agent
             self.next_agent += 1
-        print(f"sending agent_id {work_id} to {remote_address}")
+        # print(f"sending agent_id {work_id} to {remote_address}")
         if work_id != -1:
             self.client_db[remote_address].append(work_id)
-        print(self.client_db[remote_address])
+        # print(self.client_db[remote_address])
         msg = f"ok:{str(work_id)}"
         client_socket.send(bytes(msg, "utf-8"))
         decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
@@ -210,7 +210,7 @@ class AgentManager:
             client_socket.send(bytes("invalid", "utf-8"))
             self.client_db[remote_address] = []
         else:
-            print(f"client {remote_address} gave score {score} for agent {agent_id} generation {generation}")
+            # print(f"client {remote_address} gave score {score} for agent {agent_id} generation {generation}")
             self.agents[agent_id].score = score
             self.scores[agent_id] = score
             self.completed_agents += 1
@@ -247,10 +247,10 @@ class AgentManager:
             while current_gen is not None:
                 for proc_id in range(len(proc_ids)):
                     if proc_ids[proc_id] == -1:
-                        print(f"requesting work for generation {current_gen}")
+                        # print(f"requesting work for generation {current_gen}")
                         agent_index = self.client_get_work(server_address, server_port, current_gen)
                         if agent_index is not None and agent_index != -1:
-                            print(f"worker{proc_id} got agent {agent_index}")
+                            # print(f"worker{proc_id} got agent {agent_index}")
                             proc_ids[proc_id] = agent_index
                             do_render = True if self.render_all_agents else False
                             pickle.dump([self.agents[agent_index],
@@ -267,7 +267,7 @@ class AgentManager:
                         try:
                             result = pickle.load(open(f"{self.worker_dir}worker{proc_id}result", "rb"))
                             if result is not None:
-                                print(f"worker{proc_id} ")
+                                # print(f"worker{proc_id} ")
                                 self.client_send_result(server_address, server_port, proc_ids[proc_id], result,
                                                         current_gen)
                                 proc_ids[proc_id] = -1
@@ -280,9 +280,9 @@ class AgentManager:
                                               "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                             open(f"{self.worker_dir}worker{proc_id}", "wb"))
                         except (FileNotFoundError, EOFError):
-                            sleep(0.3)
-                print(f"proc_ids: {proc_ids}")
-            sleep(1.0)
+                            pass
+                sleep(0.1)
+            sleep(2.0)
 
     def connect_to_server(self, server_address, server_port):
         try:
@@ -352,7 +352,7 @@ class AgentManager:
             msg = s.recv(self.buffer_size)
             decoded_msg = msg.decode("utf-8")
             if decoded_msg == "ok":
-                print(f"sending score {score} for agent {agent_id} generation {generation}")
+                # print(f"sending score {score} for agent {agent_id} generation {generation}")
                 return 0
             else:
                 print(f"client_send_results failed. server responded with {decoded_msg}")
@@ -385,7 +385,6 @@ class AgentManager:
                                       "do_render": do_render, "render_watchdog": self.render_watchdog,
                                       "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                     open(self.worker_dir+"worker"+str(proc_id), "wb"))
-                        sleep(0.1)
                     else:
                         try:
                             agent_score = pickle.load(open(self.worker_dir+"worker"+str(proc_id)+"result", "rb"))
@@ -397,8 +396,8 @@ class AgentManager:
                                               "all_eps": self.render_all_episodes}],
                                             open(self.worker_dir+"worker" + str(proc_id), "wb"))
                             else:
-                                print(f"worker{proc_id} gave score {agent_score} for agent {proc_ids[proc_id]} "
-                                      f"generation {self.current_generation}")
+                                # print(f"worker{proc_id} gave score {agent_score} for agent {proc_ids[proc_id]} "
+                                #       f"generation {self.current_generation}")
 
                                 self.scores[proc_ids[proc_id]] = agent_score
                                 self.agents[proc_ids[proc_id]].score = agent_score
@@ -406,9 +405,8 @@ class AgentManager:
                                 proc_ids[proc_id] = -1
                                 self.remove_file(self.worker_dir+"worker"+str(proc_id)+"result")
                         except (FileNotFoundError, EOFError):
-                            # print("could not read", self.worker_dir+"worker"+str(proc_id)+"result")
-                            sleep(0.1)
-                print(f"proc_ids: {proc_ids}")
+                            pass
+                sleep(0.1)
                 a_status = f"gen: {e+1} agent: {self.next_agent-1}"
                 self.frontend.control_window.status1_label_var.set(a_status)
             best_agents = self.process_agents(e)
