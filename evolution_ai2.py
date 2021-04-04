@@ -35,7 +35,7 @@ class AgentManager:
         self.episodes_per_agent = episodes_per_agent
         self.cross_over_chance = 0.5
         self.mutate_chance = 0.2
-        self.random_weight_chance = 0.01
+        self.random_weight_chance = 0.1
         self.max_mutate_amount = 0.2
         self.population_to_keep = int(self.total_population * pool_size)
         print(f"pool/population size {self.population_to_keep}/{self.total_population}")
@@ -50,6 +50,7 @@ class AgentManager:
         self.next_agent = 0
         self.current_generation = 0
         self.completed_agents = 0
+        self.high_score = -999
         self.is_training = False
         self.client_db = {}
         self.is_client = is_client
@@ -219,7 +220,7 @@ class AgentManager:
     def send_agents_to_client(self, remote_address, client_socket):
         data = [[agent.network, agent.biases] for agent in self.agents]
         agents_bytes = json.dumps(data).encode("utf-8")
-        print(f"sending agents to {remote_address}")
+        # print(f"sending agents to {remote_address}")
         msg = f"ok:{str(len(agents_bytes))}:{self.current_generation}"
         client_socket.send(bytes(msg, "utf-8"))
         decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
@@ -227,7 +228,7 @@ class AgentManager:
             client_socket.sendall(agents_bytes)
             decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
             if decoded_resp == str(len(agents_bytes)):
-                client_socket.send(bytes("ok", "utf-8"))
+                client_socket.send(bytes(f"ok:{self.high_score}", "utf-8"))
             else:
                 print(f"client {remote_address} unknown response - {decoded_resp}")
                 client_socket.send(bytes("closing", "utf-8"))
@@ -244,7 +245,7 @@ class AgentManager:
         while True:
             current_gen = self.connect_to_server(server_address, server_port)
             self.current_generation = current_gen
-            while current_gen is not None:
+            while current_gen != -1:
                 for proc_id in range(len(proc_ids)):
                     if proc_ids[proc_id] == -1:
                         # print(f"requesting work for generation {current_gen}")
@@ -260,8 +261,7 @@ class AgentManager:
                                         open(f"{self.worker_dir}worker{proc_id}", "wb"))
                         else:
                             if proc_ids == [-1, -1, -1, -1]:
-                                print("refreshing agents")
-                                current_gen = None
+                                current_gen = -1
                                 break
                     else:
                         try:
@@ -284,7 +284,7 @@ class AgentManager:
                 sleep(0.1)
                 if time() - last_ui_update_time > 1:
                     last_ui_update_time = time()
-                    self.update_ui(current_gen, proc_ids)
+                    self.update_status_line_1(current_gen, proc_ids)
             sleep(2.0)
 
     def connect_to_server(self, server_address, server_port):
@@ -298,15 +298,15 @@ class AgentManager:
             if decoded_msg[0] == "ok":
                 s.send(bytes("ok", "utf-8"))
                 agent_bytes = bytes()
-                print("receiving agent networks from server")
                 data_counter = 0
                 while data_counter < int(decoded_msg[1]):
                     agent_bytes += s.recv(102400)
                     data_counter = len(agent_bytes)
                 if len(agent_bytes) == int(decoded_msg[1]):
                     s.send(bytes(str(len(agent_bytes)), "utf-8"))
-                    resp = s.recv(2).decode("utf-8")
-                    if resp == "ok":
+                    resp = s.recv(self.buffer_size).decode("utf-8")
+                    resp = resp.split(sep=":")
+                    if resp[0] == "ok":
                         data = json.loads(agent_bytes.decode("utf-8"))
                         self.agents = []
                         for a in range(len(data)):
@@ -316,14 +316,17 @@ class AgentManager:
                             agent.network = data[a][0]
                             agent.biases = data[a][1]
                             self.agents.append(agent)
-                        print(f"received {len(self.agents)} agents for generation {decoded_msg[2]}")
-                        return decoded_msg[2]
+                        gen = int(decoded_msg[2])
+                        self.high_score = float(resp[1])
+                        print(f"received {len(self.agents)} agents for generation {gen} high score {self.high_score}")
+                        self.update_status_line_2(f"gen {gen} high score {round(self.high_score, ndigits=2)}")
+                        return gen
                 else:
                     print("data length was not correct")
                     s.send(bytes("closing", "utf-8"))
         except (ConnectionError, socket.timeout, TimeoutError, OSError) as e:
             print("server seems unavailable at", server_address, e)
-        return None
+        return -1
 
     def client_get_work(self, server_address, server_port, generation):
         try:
@@ -412,7 +415,7 @@ class AgentManager:
                             pass
                 sleep(0.1)
                 if time() - last_ui_update_time > 1:
-                    self.update_ui(e, proc_ids)
+                    self.update_status_line_1(e, proc_ids)
                     last_ui_update_time = time()
             best_agents = self.process_agents(e)
             self.scores = [0.0 for _ in range(self.total_population)]
@@ -421,14 +424,18 @@ class AgentManager:
         self.frontend.control_window.train_thread = None
         self.is_training = False
 
-    def update_ui(self, gen, current_agents):
+    def update_status_line_1(self, gen, current_agents):
         running_local_agents = [x for x in current_agents]
         running_remote_agents = []
         for key in self.client_db.keys():
             for p_id in self.client_db[key]:
                 running_remote_agents.append(p_id)
-        a_status = f"gen: {gen} running agents: {running_local_agents}{running_remote_agents}"
+        gen_for_str = gen if gen is not None else -1
+        a_status = f"gen: {gen_for_str+1} running agents: {running_local_agents}{running_remote_agents}"
         self.frontend.control_window.status1_label_var.set(a_status)
+
+    def update_status_line_2(self, status_string):
+        self.frontend.control_window.status2_label_var.set(status_string)
 
     def play_episode(self, agent, env, do_render=False, render_watchdog=False, render_done=False, timestep_limit=None):
         agent_score = 0
@@ -475,7 +482,7 @@ class AgentManager:
         overall_avg_score = avg_score
         best_agents = []
         self.scores.sort(reverse=True)
-        high_score = self.scores[0]
+        self.high_score = self.scores[0]
         for i in range(self.population_to_keep):
             shuffled_list = list(range(len(self.agents)))
             shuffle(shuffled_list)
@@ -484,10 +491,10 @@ class AgentManager:
                 if _agent.score == self.scores[i] and _agent.agent_id not in best_agents:
                     best_agents.append(_agent.agent_id)
                     break
-        e_status = f"gen: {epoch + 1} avg: {round(overall_avg_score, ndigits=2)} high: {round(high_score, ndigits=2)}" \
-                   f" top 3: {best_agents[:3]} best layout: {self.agents[best_agents[0]].network_layout}"
+        e_status = f"gen: {epoch+1} avg: {round(overall_avg_score, ndigits=2)} high: {round(self.high_score, ndigits=2)}" \
+                   f" top 5: {best_agents[:5]} best layout: {self.agents[best_agents[0]].network_layout}"
         print(e_status)
-        self.frontend.control_window.status2_label_var.set(e_status)
+        self.update_status_line_2(e_status)
 
         # all_agents = list(range(self.total_population))
         for p in range(self.total_population):
@@ -536,6 +543,7 @@ class AgentManager:
                     _bias = chosen_biases[layer][bias_index] + (self.random_float() * self.max_mutate_amount)
                     if abs(_bias) > 1.0 or random() < self.random_weight_chance:
                         _bias = self.random_float()
+                    # noinspection PyTypeChecker
                     chosen_biases[layer][bias_index] = _bias
         return deepcopy(chosen_network), deepcopy(chosen_biases)
 
@@ -679,7 +687,7 @@ class ControlWindow:
         self.render_watchdog_checkbox = tk.Checkbutton(self.frame, width=7, height=1, bg="#AAAAAA", text="Watchdog",
                                                        command=self.toggle_render_watchdog)
         self.render_watchdog_checkbox.place(x=375, y=35)
-        self.render_best_checkbox = tk.Checkbutton(self.frame, width=3, height=1, bg="#AAAAAA", text="Best 3",
+        self.render_best_checkbox = tk.Checkbutton(self.frame, width=3, height=1, bg="#AAAAAA", text="Best 5",
                                                    command=self.toggle_render_best)
         self.render_best_checkbox.place(x=465, y=35)
         self.render_all_agents_checkbox = tk.Checkbutton(self.frame, width=5, height=1, bg="#AAAAAA", text="Agents",
@@ -769,6 +777,6 @@ class ControlWindow:
 
 
 if __name__ == "__main__":
-    manager = AgentManager(population=100, pool_size=0.1, network_layout=[8, 16, 16, 2], env_name="LunarLanderContinuous-v2",
+    manager = AgentManager(population=100, pool_size=0.1, network_layout=[24, 16, 16, 4], env_name="BipedalWalker-v3",
                            continuous_action=True, episodes_per_agent=10, use_watchdog=500, watchdog_penalty=100,
                            generations=500, obs_scale=1, action_scale=1, n_procs=4)
