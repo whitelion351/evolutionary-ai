@@ -43,11 +43,11 @@ class AgentManager:
         self.worker_dir = "workers/"
         self.bind_address = "0.0.0.0"
         self.port = 8012
-        self.server_address = "192.168.0.8"
+        self.server_address = "192.168.0.1"
         self.server_port = 8012
         self.socket_timeout = 10
         self.buffer_size = 2048
-        self.next_agent = 0
+        self.waiting_agent_list = []
         self.current_generation = 0
         self.completed_agents = 0
         self.high_score = -999
@@ -164,37 +164,44 @@ class AgentManager:
                 print("Error in client communication:", e)
 
     def talk_to_client(self, client_socket, remote_address, client_msg):
+        can_add = False
         if client_msg[1] == "connect":
             result = self.send_agents_to_client(remote_address, client_socket)
             if result == 0 and remote_address not in self.client_db.keys():
-                self.client_db[remote_address] = []
+                self.client_db[remote_address] = {"last_seen": time(), "proc_ids": []}
                 print(f"added {remote_address} to client_db")
+            elif remote_address in self.client_db.keys():
+                for agent_id in self.client_db[remote_address]["proc_ids"]:
+                    self.waiting_agent_list.append(agent_id)
+                self.client_db[remote_address] = {"last_seen": time(), "proc_ids": []}
         elif client_msg[1] == "get":
             self.send_work_to_client(remote_address, client_socket, client_msg)
+            self.client_db[remote_address]["last_seen"] = time()
         elif client_msg[1] == "put":
             # print(f"client {remote_address} agent {client_msg[2]} score {client_msg[3]} generation {client_msg[4]}")
             self.get_result_from_client(remote_address, client_socket, client_msg)
+            self.client_db[remote_address]["last_seen"] = time()
 
     def send_work_to_client(self, remote_address, client_socket, client_msg):
         # print(f"{remote_address} requesting work for generation {client_msg[2]}")
-        if self.is_training is False or self.next_agent >= self.total_population \
+        if self.is_training is False or len(self.waiting_agent_list) == 0 \
                 or client_msg[2] != str(self.current_generation):
             work_id = -1
         else:
-            work_id = self.next_agent
-            self.next_agent += 1
+            work_id = self.waiting_agent_list.pop(0)
         # print(f"sending agent_id {work_id} to {remote_address}")
-        if work_id != -1:
-            self.client_db[remote_address].append(work_id)
-        # print(self.client_db[remote_address])
         msg = f"ok:{str(work_id)}"
         client_socket.send(bytes(msg, "utf-8"))
         decoded_resp = client_socket.recv(self.buffer_size).decode("utf-8")
         if decoded_resp == str(work_id):
             client_socket.send(bytes("ok", "utf-8"))
+            if work_id != -1:
+                self.client_db[remote_address]["proc_ids"].append(work_id)
         else:
-            print(f"client {remote_address} invalid response - '{decoded_resp}'")
+            print(f"client {remote_address} gave invalid response '{decoded_resp}' to work id")
             client_socket.send(bytes("closing", "utf-8"))
+            if work_id != -1:
+                self.waiting_agent_list.append(work_id)
             return 1
         return 0
 
@@ -205,7 +212,7 @@ class AgentManager:
         if generation != self.current_generation:
             print(f"client {remote_address} sent expired results")
             client_socket.send(bytes("expired", "utf-8"))
-        elif agent_id not in self.client_db[remote_address]:
+        elif remote_address in self.client_db.keys() and agent_id not in self.client_db[remote_address]["proc_ids"]:
             print(f"client {remote_address} gave results for agent {agent_id} "
                   f"which is not in {self.client_db[remote_address]}")
             client_socket.send(bytes("invalid", "utf-8"))
@@ -215,7 +222,7 @@ class AgentManager:
             self.scores[agent_id] = score
             self.completed_agents += 1
             client_socket.send(bytes("ok", "utf-8"))
-            self.client_db[remote_address].remove(agent_id)
+            self.client_db[remote_address]["proc_ids"].remove(agent_id)
 
     def send_agents_to_client(self, remote_address, client_socket):
         data = [[agent.network, agent.biases] for agent in self.agents]
@@ -248,14 +255,12 @@ class AgentManager:
             while current_gen != -1:
                 for proc_id in range(len(proc_ids)):
                     if proc_ids[proc_id] == -1:
-                        # print(f"requesting work for generation {current_gen}")
                         agent_index = self.client_get_work(server_address, server_port, current_gen)
                         if agent_index is not None and agent_index != -1:
-                            # print(f"worker{proc_id} got agent {agent_index}")
                             proc_ids[proc_id] = agent_index
                             do_render = True if self.render_all_agents else False
                             pickle.dump([self.agents[agent_index],
-                                         {"agent_id": self.next_agent, "eps": self.episodes_per_agent,
+                                         {"agent_id": agent_index, "eps": self.episodes_per_agent,
                                           "do_render": do_render, "render_watchdog": self.render_watchdog,
                                           "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                         open(f"{self.worker_dir}worker{proc_id}", "wb"))
@@ -275,7 +280,7 @@ class AgentManager:
                             else:
                                 do_render = True if self.render_all_agents else False
                                 pickle.dump([self.agents[proc_ids[proc_id]],
-                                             {"agent_id": self.next_agent, "eps": self.episodes_per_agent,
+                                             {"agent_id": proc_ids[proc_id], "eps": self.episodes_per_agent,
                                               "do_render": do_render, "render_watchdog": self.render_watchdog,
                                               "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                             open(f"{self.worker_dir}worker{proc_id}", "wb"))
@@ -375,20 +380,19 @@ class AgentManager:
         last_ui_update_time = time()
         for e in range(self.generations):
             self.current_generation = e
-            self.next_agent = 0
+            self.waiting_agent_list = [a for a in range(len(self.agents))]
             self.completed_agents = 0
             proc_ids = [-1 for _ in range(self.n_procs)]
             while self.completed_agents < self.total_population:
                 for proc_id in range(self.n_procs):
-                    if self.next_agent < self.total_population and proc_ids[proc_id] == -1:
-                        do_render = True if self.next_agent in best_agents[:3] and self.render_best \
+                    if len(self.waiting_agent_list) != 0 and proc_ids[proc_id] == -1:
+                        next_agent = self.waiting_agent_list.pop(0)
+                        do_render = True if next_agent in best_agents and self.render_best \
                             or self.render_all_agents \
                             else False
-                        next_id = self.next_agent
-                        self.next_agent += 1
-                        proc_ids[proc_id] = next_id
-                        pickle.dump([self.agents[next_id],
-                                     {"agent_id": next_id, "eps": self.episodes_per_agent,
+                        proc_ids[proc_id] = next_agent
+                        pickle.dump([self.agents[next_agent],
+                                     {"agent_id": next_agent, "eps": self.episodes_per_agent,
                                       "do_render": do_render, "render_watchdog": self.render_watchdog,
                                       "render_done": self.render_done, "all_eps": self.render_all_episodes}],
                                     open(self.worker_dir+"worker"+str(proc_id), "wb"))
@@ -414,6 +418,12 @@ class AgentManager:
                         except (FileNotFoundError, EOFError):
                             pass
                 sleep(0.1)
+                for key in list(self.client_db.keys()):
+                    if time() - self.client_db[key]["last_seen"] > 60:
+                        for client_work_id in self.client_db[key]["proc_ids"]:
+                            self.waiting_agent_list.append(client_work_id)
+                        print(f"removing {key} from client_db - inactive")
+                        del self.client_db[key]
                 if time() - last_ui_update_time > 1:
                     self.update_status_line_1(e, proc_ids)
                     last_ui_update_time = time()
@@ -428,7 +438,7 @@ class AgentManager:
         running_local_agents = [x for x in current_agents]
         running_remote_agents = []
         for key in self.client_db.keys():
-            for p_id in self.client_db[key]:
+            for p_id in self.client_db[key]["proc_ids"]:
                 running_remote_agents.append(p_id)
         gen_for_str = gen if gen is not None else -1
         a_status = f"gen: {gen_for_str+1} running agents: {running_local_agents}{running_remote_agents}"
@@ -491,10 +501,10 @@ class AgentManager:
                 if _agent.score == self.scores[i] and _agent.agent_id not in best_agents:
                     best_agents.append(_agent.agent_id)
                     break
-        e_status = f"gen: {epoch+1} avg: {round(overall_avg_score, ndigits=2)} high: {round(self.high_score, ndigits=2)}" \
-                   f" top 5: {best_agents[:5]} best layout: {self.agents[best_agents[0]].network_layout}"
-        print(e_status)
-        self.update_status_line_2(e_status)
+        e_stat = f"gen:{epoch+1} avg:{round(overall_avg_score, ndigits=2)} high:{round(self.high_score, ndigits=2)}" \
+                 f" top 5: {best_agents[:5]} best layout: {self.agents[best_agents[0]].network_layout}"
+        print(e_stat)
+        self.update_status_line_2(e_stat)
 
         # all_agents = list(range(self.total_population))
         for p in range(self.total_population):
@@ -534,17 +544,19 @@ class AgentManager:
             for node in range(len(chosen_network[layer])):
                 for weight in range(len(chosen_network[layer][node])):
                     if random() < self.mutate_chance:
-                        _weight = chosen_network[layer][node][weight] + (self.random_float() * self.max_mutate_amount)
-                        if abs(_weight) > 1.0 or random() < self.random_weight_chance:
-                            _weight = self.random_float()
-                        chosen_network[layer][node][weight] = _weight
+                        if random() < self.random_weight_chance:
+                            _wt = self.random_float()
+                        else:
+                            _wt = chosen_network[layer][node][weight] + (self.random_float() * self.max_mutate_amount)
+                        chosen_network[layer][node][weight] = float(np.clip(_wt, -1.0, 1.0))
             for bias_index in range(len(chosen_biases[layer])):
                 if 0 <= layer < len(chosen_network) - 1 and random() < self.mutate_chance:
-                    _bias = chosen_biases[layer][bias_index] + (self.random_float() * self.max_mutate_amount)
-                    if abs(_bias) > 1.0 or random() < self.random_weight_chance:
+                    if random() < self.random_weight_chance:
                         _bias = self.random_float()
+                    else:
+                        _bias = chosen_biases[layer][bias_index] + (self.random_float() * self.max_mutate_amount)
                     # noinspection PyTypeChecker
-                    chosen_biases[layer][bias_index] = _bias
+                    chosen_biases[layer][bias_index] = float(np.clip(_bias, -1.0, 1.0))
         return deepcopy(chosen_network), deepcopy(chosen_biases)
 
 
@@ -777,6 +789,6 @@ class ControlWindow:
 
 
 if __name__ == "__main__":
-    manager = AgentManager(population=100, pool_size=0.1, network_layout=[24, 16, 16, 4], env_name="BipedalWalker-v3",
-                           continuous_action=True, episodes_per_agent=10, use_watchdog=500, watchdog_penalty=100,
-                           generations=500, obs_scale=1, action_scale=1, n_procs=4)
+    manager = AgentManager(population=100, pool_size=0.1, network_layout=[8, 16, 16, 2], env_name="LunarLanderContinuous-v2",
+                           continuous_action=True, episodes_per_agent=10, generations=500, obs_scale=1, action_scale=1,
+                           n_procs=4)
