@@ -43,7 +43,7 @@ class AgentManager:
         self.worker_dir = "workers/"
         self.bind_address = "0.0.0.0"
         self.port = 8015
-        self.server_address = "64.150.251.115"
+        self.server_address = "192.168.1.10"
         self.server_port = 8015
         self.socket_timeout = 60
         self.buffer_size = 2048
