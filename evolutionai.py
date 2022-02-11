@@ -5,7 +5,12 @@ from time import time
 from threading import Thread
 from multiprocessing import Process
 from time import sleep
+
+import cv2
 import gym
+# from FceuxEnv import FceuxEnv
+# import pybulletgym
+
 import numpy as np
 import tkinter as tk
 import os
@@ -16,9 +21,10 @@ import pickle
 
 
 class AgentManager:
-    def __init__(self, population=50, network_layout=None, env_name=None, continuous_action=True, generations=999,
-                 episodes_per_agent=1, pool_size=0.25, obs_scale=1, action_scale=1, input_nodes=2, output_nodes=2,
-                 timestep_limit=None, use_watchdog=0, watchdog_penalty=0, n_procs=-1, is_client=False):
+    def __init__(self, population=50, network_layout=None, env_name=None, obs_is_image=False, continuous_action=False,
+                 generations=1000, episodes_per_agent=1, pool_fraction_to_keep=0.1, obs_scale=1.0, action_scale=1.0,
+                 input_nodes=2, output_nodes=2, timestep_limit=None, use_watchdog=0, watchdog_penalty=0,
+                 n_procs=-1, is_client=False):
         self.n_procs = psutil.cpu_count() if n_procs == -1 else n_procs
         self.watchdog_penalty = watchdog_penalty
         self.input_nodes = input_nodes
@@ -26,31 +32,33 @@ class AgentManager:
         self.generations = generations
         self.obs_scale_factor = obs_scale
         self.action_scale_factor = action_scale
-        self.total_population = population
         self.env_name = env_name
+        self.obs_is_image = obs_is_image
         self.continuous_action = continuous_action
         self.timestep_limit = timestep_limit
         self.use_watchdog = use_watchdog
         self.network_layout = network_layout
         self.episodes_per_agent = episodes_per_agent
-        self.cross_over_chance = 0.5
-        self.mutate_chance = 1.0
-        self.random_weight_chance = 0.001
-        self.max_mutate_amount = 0.1
-        self.population_to_keep = int(self.total_population * pool_size)
-        print(f"pool/population size {self.population_to_keep}/{self.total_population}")
+        self.cross_over_chance = 0.50
+        self.mutate_chance = 0.5
+        self.random_weight_chance = 0.0005
+        self.max_mutate_amount = 0.2
+        self.total_population = population
+        self.pool_size = int(self.total_population * pool_fraction_to_keep)
+        print(f"pool/population size: {self.pool_size}/{self.total_population}")
+        self.scores = [0.0 for _ in range(self.total_population)]
         self.model_dir = "models/"
         self.worker_dir = "workers/"
         self.bind_address = "0.0.0.0"
-        self.port = 8015
-        self.server_address = "192.168.1.10"
-        self.server_port = 8015
-        self.socket_timeout = 60
+        self.port = 8017
+        self.server_address = "192.168.138.1"
+        self.server_port = 8017
+        self.socket_timeout = 30
         self.buffer_size = 2048
         self.waiting_agent_list = []
         self.current_generation = 0
         self.completed_agents = 0
-        self.high_score = -999
+        self.high_score = -9999
         self.is_training = False
         self.client_db = {}
         self.is_client = is_client
@@ -59,88 +67,138 @@ class AgentManager:
         self.render_best = False
         self.render_all_agents = False
         self.render_all_episodes = False
-        for w in range(self.n_procs):
-            self.remove_file(self.worker_dir+"worker"+str(w))
-            self.remove_file(self.worker_dir+"worker"+str(w)+"result")
 
-        if self.env_name is None:
-            self.train_env = None
-            self.play_env = None
-        else:
-            self.set_env(env_name)
+        self.read_config_txt()
+
+        for w in range(self.n_procs):
+            self.remove_file(self.worker_dir+"worker"+str(w), False)
+            self.remove_file(self.worker_dir+"worker"+str(w)+"result", False)
 
         print(f"starting {self.n_procs} processes")
         for w in range(self.n_procs):
             proc = Process(name="worker"+str(w), target=self.worker, daemon=True, args=(w,))
             proc.start()
-            sleep(0.5)
+        sleep(0.5)
 
         self.agents = self.create_population()
+        print("initial population created")
+
         if not self.is_client:
-            self.scores = [0.0 for _ in range(self.total_population)]
             self.network_thread = Thread(name="server_thread", target=self.server_thread_function, daemon=True)
             self.network_thread.start()
+            print("server thread started")
         else:
-            self.network_thread = Thread(name="client_thread", target=self.client_thread_function, daemon=True,
-                                         args=[self.server_address, self.server_port])
+            self.network_thread = Thread(name="client_thread", target=self.client_thread_function, daemon=True)
             self.network_thread.start()
+            print("client thread started")
 
         print("starting frontend")
+        self.update_status_interval = 0.5
         self.frontend = MainWindow(self)
         self.frontend.mainloop()
 
-    @staticmethod
-    def remove_file(file_to_remove):
+    def read_config_txt(self):
         try:
-            os.remove(file_to_remove)
-        except OSError:
+            with open("config.txt", "r") as f:
+                entries = f.readlines()
+                for entry in entries:
+                    entry = entry.strip()
+                    if entry.find("=") >= 0:
+                        key, value = entry.split("=")
+                        if key == "server_address":
+                            self.server_address = value
+        except FileNotFoundError:
+            print("config.txt not found")
             pass
 
-    def set_env(self, env_name):
-        print("setting env to", env_name)
-        self.env_name = env_name
-        self.train_env = gym.make(self.env_name)
-        self.play_env = gym.make(self.env_name)
-        print("environment details")
-        print(self.train_env.observation_space)
-        print(self.train_env.action_space)
+    @staticmethod
+    def remove_file(file_to_remove, print_failures=True):
+        try:
+            os.remove(file_to_remove)
+            return True
+        except OSError as err:
+            if print_failures:
+                print(f"failed to remove {file_to_remove} - {err}")
+                return False
 
-    def create_population(self):
-        agents = []
-        for a in range(self.total_population):
+    def get_env(self, env_name):
+        if self.env_name is None and env_name is None:
+            return None
+        self.env_name = env_name
+        if self.env_name.find("_custom_") >= 0:
+            # env = FceuxEnv()
+            env = gym.make(self.env_name)
+        else:
+            env = gym.make(self.env_name)
+        # print("environment details")
+        # print("observation space:", env.observation_space)
+        # print("action space:", env.action_space)
+        return env
+
+    def create_population(self, append=None):
+        if append is None or append == 0:
+            agents = []
+            total_to_create = self.total_population
+        else:
+            agents = deepcopy(self.agents)
+            total_to_create = append
+            print(f"appending {append} random agents to population")
+
+        for a in range(total_to_create):
             agent = Agent(agent_id=a, network_layout=self.network_layout, continuous_action=self.continuous_action,
                           input_nodes=self.input_nodes, output_nodes=self.output_nodes)
             agents.append(agent)
+        self.scores = [0.0 for _ in range(len(agents))]
         return agents
 
     def worker(self, w_id):
-        env = gym.make(self.env_name)
+        env = None
+        env_name = None
+        # if w_id == 0:
+        #     env.render()
         proc = psutil.Process()
         proc.cpu_affinity()  # arg would be cpu to run on
-        print("started worker", w_id, "with affinity", proc.cpu_affinity())
+        print("worker", w_id, "started", proc.cpu_affinity())
         while True:
             try:
-                worker_work = pickle.load(open(self.worker_dir+"worker" + str(w_id), "rb"))
-                agent = worker_work[0]
-                eps_per_agent = worker_work[1]["eps"]
-                agent_score = 0
-                for ep in range(eps_per_agent):
-                    do_render = worker_work[1]["do_render"]
-                    do_render = False if ep != 0 and worker_work[1]["all_eps"] is False else do_render
-                    agent_score += self.play_episode(agent, env, do_render=do_render,
-                                                     render_watchdog=worker_work[1]["render_watchdog"],
-                                                     render_done=worker_work[1]["render_done"],
-                                                     timestep_limit=self.timestep_limit)
-                agent_score /= self.episodes_per_agent
-                self.remove_file(self.worker_dir+"worker" + str(w_id))
-                pickle.dump(agent_score, open(self.worker_dir+"worker"+str(w_id)+"result", "wb"))
+                with open(self.worker_dir+"worker" + str(w_id), "rb") as worker_file:
+                    worker_work = pickle.load(worker_file)
+                work_env_name = worker_work["env_name"]
+                if work_env_name != "" and work_env_name != env_name:
+                    print(f"worker {w_id} - {work_env_name}")
+                    if env is not None:
+                        env.close()
+                    env_name = work_env_name
+                    env = self.get_env(work_env_name)
+                if env is not None:
+                    agent = worker_work["agent"]
+                    self.continuous_action = worker_work["continuous_action"]
+                    self.episodes_per_agent = worker_work["episodes_per_agent"]
+                    self.timestep_limit = worker_work["timestep_limit"]
+                    self.use_watchdog = worker_work["use_watchdog"]
+                    self.watchdog_penalty = worker_work["watchdog_penalty"]
+                    agent_score = 0
+                    for ep in range(self.episodes_per_agent):
+                        do_render = worker_work["do_render"]
+                        do_render = False if ep != 0 and worker_work["render_all_episodes"] is False else do_render
+                        agent_score += self.play_episode(agent, env, do_render=do_render,
+                                                         render_watchdog=worker_work["render_watchdog"],
+                                                         render_done=worker_work["render_done"],
+                                                         w_id=w_id)
+                    agent_score /= self.episodes_per_agent
+                    self.remove_file(self.worker_dir+"worker" + str(w_id))
+                    with open(self.worker_dir+"worker"+str(w_id)+"result", "wb") as worker_result:
+                        pickle.dump(
+                            {"id": worker_work["work_id"], "score": agent_score, "gen": worker_work["current_generation"]},
+                            worker_result
+                        )
                 sleep(0.1)
-            except (FileNotFoundError, EOFError):
+            except (FileNotFoundError, EOFError, pickle.UnpicklingError):
                 sleep(0.1)
 
     def server_thread_function(self):
-        print("starting server thread")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((self.bind_address, self.port))
         s.listen(10)
 
@@ -152,129 +210,160 @@ class AgentManager:
                 client_socket, address = s.accept()
                 client_socket.settimeout(self.socket_timeout)
                 msg = client_socket.recv(self.buffer_size)
-                decoded_msg = msg.decode("utf-8").split(sep=":")
+                decoded_msg = msg.decode("utf-8", errors="replace").split(sep=":")
                 if decoded_msg[0] == "client":
                     if decoded_msg[1] == "get":
                         self.handle_get(address[0], client_socket)
                     elif decoded_msg[1] == "put":
                         self.handle_put(address[0], client_socket, decoded_msg)
                     else:
-                        print(f"client {address[0]} invalid request {decoded_msg}")
+                        print(f"client {address[0]} made invalid request - '{decoded_msg}'")
                 else:
-                    print("unknown connection from", address[0], "sending alert response...")
-                    client_socket.send(bytes(f"alert {address[0]}", "utf-8"))
+                    print(f"unknown greeting from {address[0]} - {decoded_msg}")
+                    client_socket.send(bytes(f"invalid request {address[0]}", "utf-8"))
                 client_socket.close()
-            except (ConnectionError, socket.timeout, UnicodeDecodeError) as e:
-                print("Error in client communication:", e)
+            except (ConnectionError, socket.timeout, UnicodeDecodeError) as err:
+                print(f"{address[0]} communication error:", err)
                 if address[0] in self.client_db.keys():
                     print(f"removing {address[0]} from client_db - connection issues")
-                    for w_id in self.client_db[address[0]]["proc_ids"]:
-                        self.waiting_agent_list.append(w_id)
+                    for p_id in self.client_db[address[0]]["proc_ids"]:
+                        if p_id != -1:
+                            self.waiting_agent_list.append(p_id)
                     del self.client_db[address[0]]
 
     def handle_get(self, remote_address, client_socket):
         if self.is_training is False or len(self.waiting_agent_list) == 0:
             work_id = -1
-            agent_bytes = bytes()
         else:
             work_id = self.waiting_agent_list.pop(0)
-            agent_bytes = pickle.dumps(self.agents[work_id])
-        agent_header = f"ok:{work_id}:{len(agent_bytes)}:{self.current_generation}"
+        worker_work = {"env_name": self.env_name, "current_generation": self.current_generation,
+                       "continuous_action": self.continuous_action,
+                       "use_watchdog": self.use_watchdog, "watchdog_penalty": self.watchdog_penalty,
+                       "timestep_limit": self.timestep_limit, "episodes_per_agent": self.episodes_per_agent,
+                       "work_id": work_id, "agent": self.agents[work_id] if work_id != -1 else None}
+        work_data = pickle.dumps(worker_work)
+        agent_header = f"ok:{len(work_data)}"
         client_socket.send(bytes(agent_header, "utf-8"))
         header_resp = client_socket.recv(self.buffer_size).decode("utf-8")
-        if header_resp == str(len(agent_bytes)):
-            if len(agent_bytes) > 0:
-                client_socket.sendall(agent_bytes)
-                transfer_resp = client_socket.recv(self.buffer_size).decode("utf-8")
-                if transfer_resp == str(len(agent_bytes)):
-                    client_socket.send(bytes(f"ok:{self.high_score}", "utf-8"))
-                    if remote_address in self.client_db.keys():
-                        self.client_db[remote_address]["last_seen"] = time()
-                        self.client_db[remote_address]["proc_ids"].append(work_id)
-                    else:
-                        self.client_db[remote_address] = {"last_seen": time(), "proc_ids": [work_id]}
+        if header_resp == str(len(work_data)):
+            client_socket.sendall(work_data)
+            transfer_resp = client_socket.recv(self.buffer_size).decode("utf-8")
+            if transfer_resp == "closing":
+                self.update_client_db_entry(remote_address, time(), work_id)
+                return
             else:
-                client_socket.send(bytes(f"ok:{self.high_score}", "utf-8"))
+                print(remote_address, "invalid response to work_data -", transfer_resp)
         elif header_resp == "closing":
-            print("client ended connection early")
+            print(remote_address, "- closed connection early")
         else:
-            print(f"client {remote_address} unknown response to agent header - '{header_resp}'")
+            print(remote_address, "invalid response to work_data header -", header_resp)
+        self.waiting_agent_list.append(work_id)
 
-    def client_get_work(self, server_address, server_port):
+    def update_client_db_entry(self, key, last_seen, new_id):
+        if key not in self.client_db:
+            self.client_db[key] = {"last_seen": last_seen, "proc_ids": []}
+            print(f"added {key} to client_db")
+        if new_id != -1 and new_id not in self.client_db[key]["proc_ids"]:
+            self.client_db[key]["last_seen"] = last_seen
+            self.client_db[key]["proc_ids"].append(new_id)
+        elif new_id == -1 and len(self.client_db[key]["proc_ids"]) == 0:
+            self.client_db[key]["last_seen"] = last_seen
+
+    def client_get_work(self):
+        env_name = ""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((server_address, server_port))
-            s.settimeout(self.socket_timeout)
+            s.connect((self.server_address, self.server_port))
+            s.settimeout(5)
             s.send(bytes("client:get", "utf-8"))
             msg = s.recv(self.buffer_size)
             header_msg = msg.decode("utf-8").split(sep=":")
-            work_id = int(header_msg[1])
-            agent_bytes_length = int(header_msg[2])
-            generation = int(header_msg[3])
             if header_msg[0] == "ok":
-                s.send(bytes(str(agent_bytes_length), "utf-8"))
-                if agent_bytes_length > 0:
-                    print(f"getting {agent_bytes_length} bytes for agent {work_id}")
-                    agent_bytes = bytes()
-                    data_counter = 0
-                    while data_counter < agent_bytes_length:
-                        agent_bytes += s.recv(102400)
-                        data_counter = len(agent_bytes)
-                    s.send(bytes(str(len(agent_bytes)), "utf-8"))
-                    resp = s.recv(self.buffer_size).decode("utf-8")
-                    resp = resp.split(sep=":")
-                    if resp[0] == "ok":
-                        data = pickle.loads(agent_bytes)
-                        self.agents[work_id] = data
-                        # for a in range(len(data)):
-                        #     agent = Agent(agent_id=a, network_layout=self.network_layout,
-                        #                   continuous_action=self.continuous_action,
-                        #                   input_nodes=self.input_nodes, output_nodes=self.output_nodes)
-                        #     agent.network = data[a][0]
-                        #     agent.biases = data[a][1]
-                        #     self.agents.append(agent)
-
-                        self.high_score = float(resp[1])
-                        self.current_generation = generation
-                        print(f"-> gen:{generation} agent:{work_id} score:{round(self.high_score, ndigits=2)}")
-                        self.update_status_line_2(f"gen:{generation} high score:{round(self.high_score, ndigits=2)}")
-                        return work_id
-        except (ConnectionError, socket.timeout, TimeoutError, OSError) as e:
-            print("server seems unavailable at", server_address, e)
-        return -1
+                data_length = int(header_msg[1])
+                s.send(bytes(str(data_length), "utf-8"))
+                work_data_bytes = bytes()
+                while len(work_data_bytes) < data_length:
+                    work_data_bytes += s.recv(102400)
+                s.send(bytes("closing", "utf-8"))
+                s.close()
+                if data_length == len(work_data_bytes):
+                    work_data = pickle.loads(work_data_bytes)
+                    if "env_name" in work_data:
+                        env_name = work_data["env_name"]
+                    if "continuous_action" in work_data:
+                        self.continuous_action = work_data["continuous_action"]
+                    if "current_generation" in work_data:
+                        if self.current_generation != work_data["current_generation"]:
+                            self.current_generation = work_data["current_generation"]
+                    if "use_watchdog" in work_data:
+                        if self.use_watchdog != work_data["use_watchdog"]:
+                            print("updating use_watchdog:", work_data["use_watchdog"])
+                        self.use_watchdog = work_data["use_watchdog"]
+                    if "watchdog_penalty" in work_data:
+                        if self.watchdog_penalty != work_data["watchdog_penalty"]:
+                            print("updating watchdog_penalty:", work_data["watchdog_penalty"])
+                        self.watchdog_penalty = work_data["watchdog_penalty"]
+                    if "timestep_limit" in work_data:
+                        if self.timestep_limit != work_data["timestep_limit"]:
+                            print("updating timestep_limit:", work_data["timestep_limit"])
+                        self.timestep_limit = work_data["timestep_limit"]
+                    if "work_id" in work_data:
+                        work_id = work_data["work_id"]
+                    else:
+                        work_id = -1
+                    if "episodes_per_agent" in work_data:
+                        if self.episodes_per_agent != work_data["episodes_per_agent"]:
+                            print("updating episodes_per_agent:", work_data["episodes_per_agent"])
+                        self.episodes_per_agent = work_data["episodes_per_agent"]
+                    if "agent" in work_data and work_data["agent"] is not None and work_id != -1:
+                        self.agents[work_id] = work_data["agent"]
+                    return env_name, work_id, work_data
+                else:
+                    print(f"client_get_work data size mismatch. size: {data_length}|received: {len(work_data_bytes)}")
+            else:
+                s.send(bytes("closing", "utf-8"))
+                s.close()
+                print(f"client_get_work header data error. received: '{header_msg}'")
+        except (ConnectionError, socket.timeout, TimeoutError, OSError) as err:
+            print("server:", self.server_address, "error:", err)
+        return env_name, -1, None
 
     def handle_put(self, remote_address, client_socket, client_msg):
-        # print(f"client {remote_address} agent {client_msg[2]} score {client_msg[3]} generation {client_msg[4]}")
         a_id = int(client_msg[2])
         score = float(client_msg[3])
         generation = int(client_msg[4])
+        # print(f"{remote_address} agent {client_msg[2]} score {client_msg[3]} generation {client_msg[4]}")
 
         if remote_address not in self.client_db.keys():
-            print(f"client {remote_address} not in client_db")
+            print(f"{remote_address} sent results for gen:{generation} agent: {a_id} but is not in the database")
             client_socket.send(bytes("invalid_client", "utf-8"))
+        elif a_id not in self.client_db[remote_address]["proc_ids"]:
+            print(f"{remote_address} sent results for gen:{generation} agent: {a_id} but was not given agent {a_id}")
+            client_socket.send(bytes("invalid_agent_id", "utf-8"))
+        elif a_id in self.waiting_agent_list:
+            print(f"{remote_address} sent results for agent: {a_id} but that agent is still waiting in queue")
+            client_socket.send(bytes("expired_id", "utf-8"))
         elif generation != self.current_generation:
-            print(f"client {remote_address} sent expired results for gen: {generation} agent: {a_id}")
-            client_socket.send(bytes("expired", "utf-8"))
+            print(f"{remote_address} sent results gen: {generation} agent: {a_id} but current gen: {self.current_generation}")
+            client_socket.send(bytes("expired_generation", "utf-8"))
             if a_id in self.client_db[remote_address]["proc_ids"]:
                 self.client_db[remote_address]["proc_ids"].remove(a_id)
-                self.waiting_agent_list.append(a_id)
-        elif remote_address in self.client_db.keys() and a_id not in self.client_db[remote_address]["proc_ids"]:
-            print(f"client {remote_address} agent {a_id} is invalid {self.client_db[remote_address]['proc_ids']}")
-            client_socket.send(bytes("invalid_work", "utf-8"))
-        elif remote_address in self.client_db.keys() and a_id in self.client_db[remote_address]["proc_ids"]:
+            else:
+                print(f"agent {a_id} was not even in proc_ids for {remote_address}")
+        else:
             self.agents[a_id].score = score
             self.scores[a_id] = score
-            self.completed_agents += 1
             client_socket.send(bytes("ok", "utf-8"))
             self.client_db[remote_address]["proc_ids"].remove(a_id)
-        else:
-            print(f"client {remote_address} sent invalid score data'{client_msg}'")
-            client_socket.send(bytes("invalid_score", "utf-8"))
+            self.completed_agents += 1
+            # print(f"{remote_address} - gen:{generation} agent: {a_id} completed_agents: {self.completed_agents}")
+            if self.completed_agents > self.total_population:
+                print(f"completed_agents '{self.completed_agents}' is greater than total population '{self.total_population}'")
 
-    def client_send_result(self, server_address, server_port, agent_id, score, generation):
+    def client_send_result(self, agent_id, score, generation):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((server_address, server_port))
+            s.connect((self.server_address, self.server_port))
             s.settimeout(self.socket_timeout)
             s.send(bytes(f"client:put:{agent_id}:{score}:{generation}", "utf-8"))
             msg = s.recv(self.buffer_size)
@@ -285,11 +374,10 @@ class AgentManager:
                 print(f"sending score failed. server responded with {decoded_msg}")
                 return 1
         except (ConnectionError, socket.timeout, TimeoutError, OSError) as e:
-            print("server seems unavailable at", server_address, e)
+            print("server seems unavailable at", self.server_address, e)
             return 1
 
-    def client_thread_function(self, server_address, server_port):
-        print("starting client thread")
+    def client_thread_function(self):
         proc_ids = [-1 for _ in range(self.n_procs)]
         last_ui_update_time = time()
         while True:
@@ -297,41 +385,42 @@ class AgentManager:
             while is_training is True:
                 for proc_id in range(len(proc_ids)):
                     if proc_ids[proc_id] == -1:
-                        agent_index = self.client_get_work(server_address, server_port)
-                        if agent_index != -1:
-                            proc_ids[proc_id] = agent_index
+                        env_name, agent_index, work_data = self.client_get_work()
+                        if agent_index != -1 and work_data is not None:
+                            # print(f"accepted work id {agent_index}")
                             do_render = True if self.render_all_agents else False
-                            pickle.dump([self.agents[agent_index],
-                                         {"agent_id": agent_index, "eps": self.episodes_per_agent,
-                                          "do_render": do_render, "render_watchdog": self.render_watchdog,
-                                          "render_done": self.render_done, "all_eps": self.render_all_episodes}],
-                                        open(f"{self.worker_dir}worker{proc_id}", "wb"))
-                        else:
-                            if proc_ids == [-1, -1, -1, -1]:
-                                is_training = False
-                                break
+                            work_data["do_render"] = do_render
+                            work_data["render_watchdog"] = self.render_watchdog
+                            work_data["render_done"] = self.render_done
+                            work_data["render_all_episodes"] = self.render_all_episodes
+                            with open(f"{self.worker_dir}worker{proc_id}", "wb") as worker_file:
+                                pickle.dump(work_data, worker_file)
+                            proc_ids[proc_id] = agent_index
+                        elif agent_index == -1 and proc_ids == [-1, -1, -1, -1]:
+                            is_training = False
+                            break
                     else:
                         try:
-                            result = pickle.load(open(f"{self.worker_dir}worker{proc_id}result", "rb"))
-                            if result is not None:
-                                self.client_send_result(server_address, server_port, proc_ids[proc_id], result,
-                                                        self.current_generation)
+                            with open(f"{self.worker_dir}worker{proc_id}result", "rb") as worker_result:
+                                result = pickle.load(worker_result)
+                            result_id = result["id"]
+                            result_score = result["score"]
+                            result_gen = result["gen"]
+                            good_id = True
+                            if result_id != proc_ids[proc_id]:
+                                print(f"id mismatch when processing results. working id: {proc_ids[proc_id]}| result id: {result_id}")
+                                good_id = False
+                            remove_success = self.remove_file(f"{self.worker_dir}worker{proc_id}result")
+                            if good_id and remove_success:
+                                self.client_send_result(result_id, result_score, result_gen)
                                 proc_ids[proc_id] = -1
-                                self.remove_file(f"{self.worker_dir}worker{proc_id}result")
-                            else:
-                                do_render = True if self.render_all_agents else False
-                                pickle.dump([self.agents[proc_ids[proc_id]],
-                                             {"agent_id": proc_ids[proc_id], "eps": self.episodes_per_agent,
-                                              "do_render": do_render, "render_watchdog": self.render_watchdog,
-                                              "render_done": self.render_done, "all_eps": self.render_all_episodes}],
-                                            open(f"{self.worker_dir}worker{proc_id}", "wb"))
                         except (FileNotFoundError, EOFError):
                             pass
                 sleep(0.1)
-                if time() - last_ui_update_time > 1:
+                if time() - last_ui_update_time > self.update_status_interval:
                     last_ui_update_time = time()
                     self.update_status_line_1(self.current_generation, proc_ids)
-            sleep(2.0)
+            sleep(1)
 
     def train(self):
         print("begin training...")
@@ -344,7 +433,12 @@ class AgentManager:
             self.waiting_agent_list = [a for a in range(len(self.agents))]
             self.completed_agents = 0
             proc_ids = [-1 for _ in range(self.n_procs)]
-            while self.completed_agents < self.total_population:
+            for key in self.client_db:
+                if len(self.client_db[key]["proc_ids"]) != 0:
+                    print(f"started generation {e} with {self.client_db[key]['proc_ids']} still running on {key}")
+                self.client_db[key]["proc_ids"] = []
+            gen_complete = False
+            while self.completed_agents < self.total_population and not gen_complete:
                 for proc_id in range(self.n_procs):
                     if len(self.waiting_agent_list) != 0 and proc_ids[proc_id] == -1:
                         next_agent = self.waiting_agent_list.pop(0)
@@ -352,42 +446,47 @@ class AgentManager:
                             or self.render_all_agents \
                             else False
                         proc_ids[proc_id] = next_agent
-                        pickle.dump([self.agents[next_agent],
-                                     {"agent_id": next_agent, "eps": self.episodes_per_agent,
-                                      "do_render": do_render, "render_watchdog": self.render_watchdog,
-                                      "render_done": self.render_done, "all_eps": self.render_all_episodes}],
-                                    open(self.worker_dir+"worker"+str(proc_id), "wb"))
+                        with open(self.worker_dir+"worker"+str(proc_id), "wb") as worker_file:
+                            pickle.dump({
+                                "env_name": self.env_name, "timestep_limit": self.timestep_limit,
+                                "continuous_action": self.continuous_action, "current_generation": self.current_generation,
+                                "use_watchdog": self.use_watchdog, "watchdog_penalty": self.watchdog_penalty,
+                                "work_id": next_agent, "agent": self.agents[next_agent],
+                                "episodes_per_agent": self.episodes_per_agent,
+                                "do_render": do_render, "render_watchdog": self.render_watchdog,
+                                "render_done": self.render_done, "render_all_episodes": self.render_all_episodes},
+                                worker_file)
                     else:
                         try:
-                            agent_score = pickle.load(open(self.worker_dir+"worker"+str(proc_id)+"result", "rb"))
-                            if agent_score is None:
-                                self.remove_file(self.worker_dir+"worker"+str(proc_id)+"result")
-                                pickle.dump([self.agents[proc_ids[proc_id]],
-                                             {"agent_id": proc_ids[proc_id],
-                                              "eps": self.episodes_per_agent, "do_render": False,
-                                              "all_eps": self.render_all_episodes}],
-                                            open(self.worker_dir+"worker" + str(proc_id), "wb"))
-                            else:
-                                # print(f"worker{proc_id} gave score {agent_score} for agent {proc_ids[proc_id]} "
-                                #       f"generation {self.current_generation}")
-
-                                self.scores[proc_ids[proc_id]] = agent_score
+                            with open(self.worker_dir+"worker"+str(proc_id)+"result", "rb") as result_file:
+                                results = pickle.load(result_file)
+                            agent_score = results["score"]
+                            if agent_score is not None:
                                 self.agents[proc_ids[proc_id]].score = agent_score
+                                self.scores[proc_ids[proc_id]] = agent_score
                                 self.completed_agents += 1
-                                proc_ids[proc_id] = -1
-                                self.remove_file(self.worker_dir+"worker"+str(proc_id)+"result")
+                                # print(f"LOCAL {proc_id} - gen:{self.current_generation} agent: {proc_ids[proc_id]} completed_agents: {self.completed_agents}")
+                                if self.completed_agents > self.total_population:
+                                    print(
+                                        f"completed_agents '{self.completed_agents}' is greater than total population '{self.total_population}'")
+                            proc_ids[proc_id] = -1
+                            self.remove_file(self.worker_dir+"worker"+str(proc_id)+"result")
                         except (FileNotFoundError, EOFError):
                             pass
                 sleep(0.1)
                 for key in list(self.client_db.keys()):
-                    if time() - self.client_db[key]["last_seen"] > 90:
+                    if time() - self.client_db[key]["last_seen"] > 60:
                         for client_work_id in self.client_db[key]["proc_ids"]:
                             self.waiting_agent_list.append(client_work_id)
                         print(f"removing {key} from client_db - inactive")
                         del self.client_db[key]
-                if time() - last_ui_update_time > 1:
+                if len(self.waiting_agent_list) == 0 and proc_ids == [-1, -1] and len(self.get_remote_agent_list()) == 0:
+                    gen_complete = True
+                if time() - last_ui_update_time > self.update_status_interval:
                     self.update_status_line_1(e, proc_ids)
                     last_ui_update_time = time()
+            if self.completed_agents != self.total_population:
+                print(f"total population: {self.total_population}| completed results: {self.completed_agents}| local ids: {proc_ids}| remote_ids: {self.get_remote_agent_list()}")
             best_agents = self.process_agents(e)
             self.scores = [0.0 for _ in range(self.total_population)]
             for a in self.agents:
@@ -395,40 +494,63 @@ class AgentManager:
         self.frontend.control_window.train_thread = None
         self.is_training = False
 
+    def get_remote_agent_list(self):
+        remote_agents = []
+        for key in self.client_db.keys():
+            remote_agents = remote_agents + self.client_db[key]["proc_ids"]
+        return remote_agents
+
     def update_status_line_1(self, gen, current_agents):
         running_local_agents = [x for x in current_agents]
-        running_remote_agents = []
-        for key in self.client_db.keys():
-            for p_id in self.client_db[key]["proc_ids"]:
-                running_remote_agents.append(p_id)
+        running_remote_agents = self.get_remote_agent_list()
         gen_for_str = gen if gen is not None else -1
-        a_status = f"gen: {gen_for_str+1} completed {self.completed_agents} " \
+        a_status = f"gen: {gen_for_str} completed {self.completed_agents} " \
                    f"running agents: {running_local_agents}{running_remote_agents}"
         self.frontend.control_window.status1_label_var.set(a_status)
 
     def update_status_line_2(self, status_string):
         self.frontend.control_window.status2_label_var.set(status_string)
 
-    def play_episode(self, agent, env, do_render=False, render_watchdog=False, render_done=False, timestep_limit=None):
+    @staticmethod
+    def process_image(img, w_id):
+        img = img[50:, :, :]
+        img = cv2.resize(img, dsize=(50, 50))
+        img = np.average(img, axis=2) / 255.0
+        # if w_id == 0:
+        #     cv2.imshow("output "+str(w_id), img)
+        #     k = cv2.waitKey(1)
+        #     if k == ord("q"):
+        #         exit()
+        img = img.flatten()
+        return img
+
+    def play_episode(self, agent, env, do_render=False, render_watchdog=False, render_done=False, w_id=-1):
         agent_score = 0
         old_agent_score = 0
-        timestep_limit = timestep_limit if timestep_limit is not None else self.timestep_limit
+        timestep_limit = self.timestep_limit
         obs_scale_factor = 1 if self.obs_scale_factor is None else self.obs_scale_factor
         action_scale_factor = 1 if self.action_scale_factor is None else self.action_scale_factor
-        obs = list(np.array(env.reset()) / obs_scale_factor)
+        obs = env.reset()
+        if self.obs_is_image:
+            obs = self.process_image(obs, w_id)
+        else:
+            obs = np.array(obs) / obs_scale_factor
         timestep = 0
         done = False
-        if do_render:
+        info = {}
+        if do_render and w_id == 0:
             env.render()
         while not done:
-            if abs(max(obs)) > 1 and obs_scale_factor != 1:
-                obs_scale_factor += 0.5
-                print(max(obs), "increasing scale_factor to", obs_scale_factor)
             action = agent.predict(obs)
-            action = list(np.array(action) * action_scale_factor) if self.continuous_action is True else action
+            action = np.array(action) * action_scale_factor if self.continuous_action is True else action
             obs, reward, done, info = env.step(action)
-            obs = list(np.array(obs) / obs_scale_factor)
-            if do_render:
+            if self.obs_is_image:
+                obs = self.process_image(obs, w_id)
+            else:
+                obs = np.array(obs) / obs_scale_factor
+            # if w_id == 0:
+            #     print(f"t: {timestep} - {action}")
+            if do_render and w_id == 0:
                 env.render()
             agent_score += reward
             timestep += 1
@@ -440,10 +562,12 @@ class AgentManager:
                     done = True
                     agent_score -= self.watchdog_penalty
                 old_agent_score = agent_score
-                if not do_render and render_watchdog:
+                if not do_render and render_watchdog and w_id == 0:
                     env.render()
-        if not do_render and render_done:
+        if not do_render and render_done and w_id == 0:
             env.render()
+        if self.obs_is_image:
+            return agent_score
         return agent_score
 
     def process_agents(self, epoch):
@@ -455,7 +579,7 @@ class AgentManager:
         best_agents = []
         self.scores.sort(reverse=True)
         self.high_score = self.scores[0]
-        for i in range(self.population_to_keep):
+        for i in range(self.pool_size):
             shuffled_list = list(range(len(self.agents)))
             shuffle(shuffled_list)
             for agent_i in shuffled_list:
@@ -463,7 +587,7 @@ class AgentManager:
                 if _agent.score == self.scores[i] and _agent.agent_id not in best_agents:
                     best_agents.append(_agent.agent_id)
                     break
-        e_stat = f"gen:{epoch+1} avg:{round(overall_avg_score, ndigits=2)} high:{round(self.high_score, ndigits=2)}" \
+        e_stat = f"gen:{epoch} avg:{round(overall_avg_score, ndigits=2)} high:{round(self.high_score, ndigits=2)}" \
                  f" top 5: {best_agents[:5]} best layout: {self.agents[best_agents[0]].network_layout}"
         print(e_stat)
         self.update_status_line_2(e_stat)
@@ -496,7 +620,7 @@ class AgentManager:
 
     @staticmethod
     def random_float():
-        return (random() - 0.5) * 2
+        return (random() - 0.5) * 2.0
 
     def mutate_network(self, agent_list):
         chosen_one = choice(agent_list)
@@ -587,7 +711,7 @@ class Agent:
                 for from_node in range(len(interim_result)):
                     activation += interim_result[from_node][index]
                 bias = biases[layer][index]
-                input_layer.append(tanh(activation+bias))
+                input_layer.append(tanh(activation)+bias)
             network_activations.append(input_layer)
         if self.continuous_action:
             return input_layer
@@ -613,10 +737,10 @@ class MainWindow(tk.Tk):
 
 
 class ControlWindow:
-    def __init__(self, root, width=700, height=240, bd=10, relief="ridge"):
+    def __init__(self, root, width=700, height=240, bd=10):
         self.root = root
         self.font = ("helvetica", 10)
-        self.frame = tk.Frame(root, width=width, height=height, bg="#AAAAAA", bd=bd, relief=relief)
+        self.frame = tk.Frame(root, width=width, height=height, bg="#AAAAAA", bd=bd, relief="ridge")
 
         if not self.root.manager_object.is_client:
             # The Start button (don't touch it)
@@ -737,13 +861,24 @@ class ControlWindow:
     def save_pop(self, save_name=None):
         save_name = self.root.manager_object.model_dir+self.root.manager_object.env_name+"_saved_population.p" \
             if save_name is None else save_name
-        pickle.dump(self.root.manager_object.agents, open(save_name, "wb"))
+        with open(save_name, "wb") as save_file:
+            pickle.dump(self.root.manager_object.agents, save_file)
         print("population saved")
 
     def load_pop(self, load_name=None):
         load_name = self.root.manager_object.model_dir+self.root.manager_object.env_name+"_saved_population.p" \
             if load_name is None else load_name
-        self.root.manager_object.agents = pickle.load(open(load_name, "rb"))
+        with open(load_name, "rb") as save_file:
+            self.root.manager_object.agents = pickle.load(save_file)
+        total_pop = len(self.root.manager_object.agents)
+        frac = self.root.manager_object.pool_fraction_to_keep
+        if total_pop > self.root.manager_object.total_population:
+            print("adjusting for difference in population size after population load")
+            difference = int(total_pop - self.root.manager_object.total_population)
+            self.root.manager_object.agents = self.root.manager_object.create_population(append=difference)
+        self.root.manager_object.total_population = total_pop
+        self.root.manager_object.pool_size = int(total_pop * frac)
+
         print("population loaded")
 
     def start_train(self):
@@ -755,7 +890,6 @@ class ControlWindow:
 
 
 if __name__ == "__main__":
-    manager = AgentManager(population=100, pool_size=0.1, network_layout=[24, 16, 16, 4], env_name="BipedalWalkerHardcore-v3",
-                           continuous_action=True, episodes_per_agent=10, generations=500, use_watchdog=300, watchdog_penalty=100,
-                           obs_scale=1, action_scale=1,
-                           n_procs=4)
+    manager = AgentManager(population=50, network_layout=[8, 16, 16, 4], env_name="LunarLander-v2",
+                           continuous_action=False, generations=2000, episodes_per_agent=5, pool_fraction_to_keep=0.1,
+                           use_watchdog=300, watchdog_penalty=0)
